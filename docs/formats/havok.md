@@ -172,6 +172,14 @@ Transforms are stored frame-major. The frame duration is `duration / (frames −
 * Each animation's local TRS becomes a pose-bone basis: `q_basis = q_rest⁻¹ · q_anim`,
   `t_basis = q_rest⁻¹ · (t_anim − t_rest)`, `s_basis = s_anim / s_rest`. The vector parts of all
   three then go through the same axis map.
+* Additive clips (blend hint 1) are deltas applied as `q = q_base · q_delta`,
+  `t = t_base + t_delta`, `s = s_base · s_delta` (local to the parent; this is the Havok 6.x
+  order, where the delta is right-multiplied). Over the rest pose that makes the basis
+  `q_basis = q_delta`, `t_basis = q_rest⁻¹ · t_delta`, `s_basis = s_delta`. Blender's
+  **Combine** blend mode multiplies quaternion bases and adds location bases, which gives
+  `q_rest⁻¹ · q_base · q_delta` and `q_rest⁻¹ · (t_base + t_delta − t_rest)`: the same result as
+  the game. So an additive action plays with Combine over the base clip on the `MAG base` NLA
+  track (`build.show_action`). The pose matches the game-space blend within 0.01 mm.
 * Quaternion signs are made continuous frame to frame. Keys are linear, one per frame, at 30 fps.
 * `tools/anim_check.py` compares Blender's evaluated pose with the game-space composition. The
   current build matches within 0.1 mm.

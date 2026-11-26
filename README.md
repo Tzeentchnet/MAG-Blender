@@ -4,6 +4,9 @@ Imports **characters, materials, animations, weapons, props, vehicles and comple
 *MAG* (PS3, Zipper Interactive, 2010) directly out of the decrypted disc image. Nothing has to be
 extracted by hand.
 
+![Part of the Kennicott map imported into Blender: the church, houses, trees and vehicles](docs/images/map_kennicott.png)
+*Part of the Kennicott map, imported in one step with its placed pieces, terrain and trees.*
+
 Tested with Blender 5.2.2 LTS and `MAG (USA).dec.iso` (retail v1.0, BCUS98110). It needs Blender
 4.4 or newer.
 
@@ -30,7 +33,56 @@ You can also use *Add-ons → Install…* for a legacy install. Either way the p
 | Weapons | Third-person models (with stock) and the *(1st person)* view models, each with its attachments mounted on the sockets: the required sight is shown, the other compatible attachments (scopes, suppressor, foregrip, bipod, grenade launcher) wait hidden in an *Attachments* collection |
 | Attachments, Gear, Vehicles, Props | The node hierarchy as objects, with meshes and materials. Vehicles keep their wheels and turrets at LOD 0 (the game only has LOD 1+ meshes for them), and their turret machine guns are mounted (M2HB, Kord, XM312, the deployable turrets' miniguns) unless the gun is part of the vehicle model |
 | Maps | Every placed piece as a collection instance, the terrain, the scenery outside the terrain (mountains, treeline cards) in a separate backdrop collection, the sky as the scene World, the baked vertex lighting of trees and bushes, and optionally the collision meshes |
-| Animations | A Blender action on the matching armature (the active one if it fits, otherwise a new one). Additive clips (`a_*` aim sweeps, recoils, flinches) play on top of the rig's current clip, which moves to the *MAG base* NLA track; import a normal clip first to choose the base. Characters can also bring their animations with them: see the **Animations** option |
+| Animations | A Blender action on the matching armature (the active one if it fits, otherwise a new one). Additive clips are layered on the rig's current clip: see [Animations](#animations) below |
+
+| Vehicle | Map piece |
+| --- | --- |
+| ![The Cougar's roof turret with its machine gun mounted](docs/images/vehicle_cougar.png) | ![A shack from a map, with its materials](docs/images/loadblock_508_528_radius_642_1d199158.png) |
+| The Cougar's turret, with the machine gun mounted on its socket | A single map piece (model `1d199158`) with its materials |
+
+### Animations
+
+<img src="docs/images/char_animations.png" alt="A soldier character posed by an animation clip" width="360" align="right">
+
+The list's right-hand column names each clip's skeleton: `root_main` (third-person body),
+`root_arms` (first-person arms), `chute_root` (parachute), `vehicle` and others for animated
+props and vehicles. A clip only fits a rig with the same skeleton.
+
+**Put a clip on a character**
+
+1. Import the character (category *Characters*). Its armature is named `<character>_rig`.
+2. Select the armature (click it in the Outliner or the viewport) so that it is the active object.
+3. Switch the category to *Animations*, pick a clip and click **Import**.
+4. Press Space in the viewport to play. The clip becomes the rig's action, and the scene's frame
+   range is set to its length.
+
+If no armature is selected, the clip goes onto the first armature in the scene with the same
+skeleton. If there is none, the importer creates a bare armature (no mesh) for it.
+
+**Additive clips** (`a_*`: aim sweeps, recoils, flinches; 26 clips for `root_main`) are not
+full poses. They hold small changes that the game layers on top of the clip already playing,
+such as a pistol recoil on a crouching aim. To see one as the game shows it:
+
+1. Import a normal clip first, for the pose to layer on (for example `crouch_aim_idle`,
+   `crouch_p_aim_idle` or `stand_p_aim_idle`).
+2. Then import the additive clip on the same rig.
+
+The normal clip moves to an NLA track named **MAG base** and keeps playing. The additive clip
+becomes the active action with its blend mode set to **Combine**, so its changes add to the base.
+The import message says which clip it was layered over. Importing another normal clip removes
+the *MAG base* track and sets the blend mode back to **Replace**. An additive clip imported with
+no base clip plays over the bind pose: it then looks almost still.
+
+The NLA editor shows the base track and its strip (looped to cover the additive clip). Its
+influence and the action's *Influence* (Action Editor) control the mix. If you switch actions
+by hand in the Action Editor, set the blend mode yourself: **Replace** for normal clips,
+**Combine** for `a_*` clips. Actions created by the importer have a `mag_additive` custom
+property that says which kind they are.
+
+**Many clips at once**: set the **Animations** import option (below) to *Idle* or *All* before
+importing a character to add its clips as actions in one go.
+
+<br clear="right">
 
 ### Options (Import Options sub-panel)
 
@@ -57,7 +109,8 @@ restarts. The other options are stored per scene.
   first-person arms). *All* adds every clip of the skeleton (461 for bodies, about 6 s; 208 for
   arms). **Filter** keeps only the clips whose name contains its text (for example `reload` or
   `stand_p_`). The idle clip (or the first clip) is assigned and sets the scene frame range. The
-  others keep a fake user, so switch them in the Action Editor.
+  others keep a fake user, so switch them in the Action Editor (additive `a_*` clips need the
+  **Combine** blend mode and a base clip: see [Animations](#animations)).
 * **Set Scene to 30 fps**: MAG animations are authored at 30 fps.
 * **Terrain**: imports the terrain tiles of one level of the terrain's LOD tree.
   * **LOD**: 0 (default) is the finest level. Each step up halves the tile count with coarser

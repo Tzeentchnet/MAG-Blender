@@ -94,7 +94,8 @@ tools/             validation and test scripts (see below)
 * **Textures**: GCM format 5/6/7/8 = A8R8G8B8/DXT1/DXT3/DXT5. Pitch 0 means a swizzled (Morton)
   ARGB texture.
 * **Animations**: Havok 6.5 `hkaSplineCompressedAnimation`. The block data is little-endian even
-  on PS3, while the packfile itself is big-endian.
+  on PS3, while the packfile itself is big-endian. The binding's blend hint (+0x18) marks 26
+  additive clips, which are deltas layered on a base clip with Blender's Combine blend mode.
 * **Maps**: `InstanceProperties` objects in `<level>.clv` hold the Mesh token plus T/R(deg)/S.
   The rotation order is `Rz·Ry·Rx`. Terrain tiles are world-space level pieces arranged in a
   binary LOD tree of right triangles (the `284C2F78` record in `globaldata.zrb`); the import
