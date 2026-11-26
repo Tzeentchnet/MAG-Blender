@@ -1,7 +1,7 @@
 """Import a map and render overview shots.
 
 blender --background --factory-startup --python tools/map_test.py -- ISO OUTDIR map_label [foliage] [fx] [eevee]
-                                                                         [terrain] [macro] [lodN]
+                                                                         [terrain] [macro] [lodN] [materials]
 
 ``foliage`` turns on foliage import, checks the evaluated instance transforms against the decoded
 data and adds a ground-level shot over the densest foliage. ``eevee`` renders with EEVEE (for
@@ -21,7 +21,10 @@ adds a shot of the collision alone (solid, object colour) and one of it over the
 renders it solid and untextured, not as the viewport's wireframe). ``light`` checks the baked
 lighting (on by default; ``nolight`` imports without it): every lit object carries ``mag_light``,
 and vertices at the same position mostly share its value (far more often than random pairs), and
-it adds a close shot of the densest group of lit placements (use with ``eevee``).
+it adds a close shot of the densest group of lit placements (use with ``eevee``). ``materials``
+counts the material kinds the header decode produces (alpha-tested, translucent, glass, water,
+UV transform, detail maps), checks their node wiring, and adds close shots of the largest glass,
+alpha-tested and detail-normal pieces (use with ``eevee``).
 """
 import os
 import sys
@@ -62,8 +65,9 @@ scene.mag.place_emitters = 'fx' in FLAGS
 scene.mag.terrain_detail = 'MACRO' if 'macro' in FLAGS else 'FULL'
 scene.mag.terrain_lod = TLOD
 scene.mag.sky = 'DOME' if 'skydome' in FLAGS else 'NONE' if 'nosky' in FLAGS else 'WORLD'
-scene.mag.collision = 'collision' in FLAGS
-scene.mag.baked_lighting = 'nolight' not in FLAGS
+from mag_importer.blender import state  # noqa: E402
+state.import_prefs().import_collision = 'collision' in FLAGS
+state.import_prefs().import_lightmaps = 'nolight' not in FLAGS
 if 'nomacrofade' in FLAGS:
     scene.mag.terrain_fade = 0.0
 ui._refresh_list()
@@ -347,6 +351,57 @@ if 'light' in FLAGS:
         inside = [p for p in P if int(p.x // 40) == gx and int(p.y // 40) == gy]
         lc = sum(inside, Vector()) / len(inside)
         shots.append(('light', lc + Vector((28, -34, 14)), lc + Vector((0, 0, 4))))
+if 'materials' in FLAGS:
+    import collections as _co
+    mats = [m for m in bpy.data.materials if m.get('mag_hash') and m.node_tree]
+    kinds = _co.Counter()
+    bad = _co.Counter()
+    for m in mats:
+        nodes = m.node_tree.nodes
+        bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        alpha_in = bsdf.inputs['Alpha'].links[0].from_node if bsdf and bsdf.inputs['Alpha'].is_linked else None
+        for k in ('mag_alpha_ref', 'mag_translucent', 'mag_glass', 'mag_water', 'mag_uv_transform',
+                  'mag_detail_normal', 'mag_detail_color'):
+            if k in m:
+                kinds[k] += 1
+        if 'mag_alpha_ref' in m:
+            want = (m['mag_alpha_ref'] - 0.5) / 255.0
+            if not (alpha_in and alpha_in.type == 'MATH' and alpha_in.operation == 'GREATER_THAN'
+                    and abs(alpha_in.inputs[1].default_value - want) < 1e-6):
+                bad['alpha test not wired'] += 1
+        elif alpha_in is not None and m.surface_render_method != 'BLENDED':
+            bad['alpha wired without alpha test or blending'] += 1
+        if m.get('mag_glass') and m.surface_render_method != 'BLENDED':
+            bad['glass not blended'] += 1
+        if 'mag_uv_transform' in m and not any(n.type == 'MAPPING' and n.label == 'Material UV transform' for n in nodes):
+            bad['uv transform node missing'] += 1
+        if 'mag_detail_normal' in m and not any(n.type == 'TEX_IMAGE' and n.label.startswith('Detail normal')
+                                                and n.outputs['Color'].is_linked for n in nodes):
+            bad['detail normal not wired'] += 1
+    print('MAP materials total=%d %s %s -> %s' % (len(mats), dict(kinds), dict(bad), 'FAIL' if bad else 'OK'))
+
+    def _densest(pred, max_size=80.0):
+        """World centre of the largest placed mesh (up to ``max_size`` m) with a material matching
+        ``pred``."""
+        best, where = 0.0, None
+        for inst in [o for o in scene.objects if o.instance_type == 'COLLECTION' and o.instance_collection]:
+            for src in inst.instance_collection.objects:
+                if src.type == 'MESH' and any(mm and pred(mm) for mm in src.data.materials):
+                    M = inst.matrix_world @ _chain(src)
+                    bb = [M @ Vector(v) for v in src.bound_box]
+                    size = (max(v.x for v in bb) - min(v.x for v in bb)) + (max(v.y for v in bb) - min(v.y for v in bb))
+                    if best < size <= max_size:
+                        best, where = size, (sum(bb, Vector()) / 8, size)
+        return where
+    for label, pred in (('glass', lambda mm: mm.get('mag_glass')),
+                        ('alphatest', lambda mm: 'mag_alpha_ref' in mm),
+                        ('detail', lambda mm: 'mag_detail_normal' in mm)):
+        hit = _densest(pred)
+        if hit:
+            p, size = hit
+            d = max(3.0, min(size, 40.0))
+            shots.append(('mat_' + label, p + Vector((0.6, -0.9, 0.45)) * d, p))
+            print('MAP materials shot %s at %s (size %.1f)' % (label, tuple(round(v, 1) for v in p), size))
 if water is not None and 'eevee' not in FLAGS:
     shots.append(('water', water + Vector((0, -0.01, 12)), water))
 fol = [o for o in scene.objects if o.get('mag_foliage_model')]

@@ -23,20 +23,62 @@ CATEGORY_ITEMS = [
 
 
 # -- preferences ------------------------------------------------------------------------------------
+def _iso_changed(self, context):
+    path = bpy.path.abspath(self.iso_path) if self.iso_path else ''
+    if path:
+        state.save_settings(iso_path=path)
+    if path and os.path.isfile(path) and state.try_load_cached(path):
+        _refresh_list()
+
+
+def _import_pref_changed(self, context):
+    state.save_import_prefs()
+
+
 class MAG_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__.rsplit('.', 1)[0]
 
-    iso_path: StringProperty(name='MAG ISO', subtype='FILE_PATH',
+    iso_path: StringProperty(name='MAG ISO', subtype='FILE_PATH', update=_iso_changed,
                              description='Decrypted MAG (USA) disc image')
     cache_dir: StringProperty(name='Cache Folder', subtype='DIR_PATH',
                               description='Where the scan index and converted textures are stored. '
                                           'Empty = Blender user config folder (survives restarts and resets)')
+    import_collision: BoolProperty(name='Import Collisions', default=False, update=_import_pref_changed,
+                                   description="Maps: import the collision meshes (physics.zrb) as wireframe "
+                                               'objects hidden from renders: terrain collision and one per '
+                                               'placed piece that has one')
+    import_lightmaps: BoolProperty(name='Import Lightmaps', default=True, update=_import_pref_changed,
+                                   description="Maps: apply the baked per-vertex lighting (sun shadow and "
+                                               'sky terms, mostly on trees): lit placements get their own '
+                                               'mesh copies with a mag_light attribute that darkens the base '
+                                               'colour (weights in the MAG Baked Light node group). Needs '
+                                               'Materials')
+    import_lower_lods: BoolProperty(name='Import Lower LODs', default=False, update=_import_pref_changed,
+                                    description='Models and characters: also import every coarser level of '
+                                                'detail than the LOD option, one hidden <name>_LOD<n> '
+                                                'sub-collection each (maps always use one LOD)')
+    pack_textures: BoolProperty(name='Pack Textures', default=False, update=_import_pref_changed,
+                                description='Pack the imported textures into the .blend, so the file works '
+                                            'on another computer or after the texture cache is cleared '
+                                            '(bigger .blend files: a map packs several hundred MB)')
 
     def draw(self, context):
-        col = self.layout.column()
+        layout = self.layout
+        col = layout.column()
         col.prop(self, 'iso_path')
         col.prop(self, 'cache_dir')
         col.label(text='Cache: ' + state.cache_dir())
+        if S.index is not None:
+            col.label(text='Index loaded: %d assets' % len(S.index.assets), icon='CHECKMARK')
+        elif S.status:
+            col.label(text=S.status, icon='INFO')
+        box = layout.box()
+        box.label(text='Import Options', icon='IMPORT')
+        col = box.column()
+        col.prop(self, 'import_collision')
+        col.prop(self, 'import_lightmaps')
+        col.prop(self, 'import_lower_lods')
+        col.prop(self, 'pack_textures')
 
 
 # -- properties -----------------------------------------------------------------------------------------
@@ -136,15 +178,6 @@ class MAG_SceneProps(bpy.types.PropertyGroup):
                 'with an unlit material'),
                ('NONE', 'None', 'Do not import the sky')),
         description="How the map's sky (sky.zrb) is imported")
-    collision: BoolProperty(name='Collision', default=False,
-                            description="Import the map's collision meshes (physics.zrb) as wireframe "
-                                        'objects hidden from renders: terrain collision and one per '
-                                        'placed piece that has one')
-    baked_lighting: BoolProperty(name='Baked Lighting', default=True,
-                                 description="Apply the map's baked per-vertex lighting (sun shadow and "
-                                             'sky terms, mostly on trees): lit placements get their own '
-                                             'mesh copies with a mag_light attribute that darkens the '
-                                             'base colour (weights in the MAG Baked Light node group)')
     sky_strength: FloatProperty(name='Sky Strength', default=1.0, min=0.0, max=100.0, soft_max=10.0,
                                 description='Strength of the sky World background')
 
@@ -252,8 +285,33 @@ class MAG_OT_clear_texture_cache(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MAG_OT_pack_textures(bpy.types.Operator):
+    """Pack every MAG texture of this file into the .blend (they then no longer depend on the cache)"""
+    bl_idname = 'mag.pack_textures'
+    bl_label = 'Pack MAG Textures'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        state.relink_textures()
+        n = missing = 0
+        for img in bpy.data.images:
+            if not state.is_mag_texture(img) or img.packed_file is not None:
+                continue
+            if not os.path.exists(bpy.path.abspath(img.filepath)):
+                missing += 1
+                continue
+            img.pack()
+            n += 1
+        msg = 'Packed %d MAG textures' % n
+        if missing:
+            msg += ' (%d files missing from the cache: re-import to recreate them)' % missing
+        self.report({'WARNING'} if missing else {'INFO'}, msg)
+        return {'FINISHED'}
+
+
 def _options(context):
     sp = context.scene.mag
+    ip = state.import_prefs()
     return build.ImportOptions(lod=sp.lod, materials=sp.materials, flip_green=sp.flip_green,
                                skeleton=sp.skeleton, set_fps=sp.set_fps, instance_maps=sp.instance_maps,
                                include_terrain=sp.include_terrain, include_foliage=sp.include_foliage,
@@ -262,7 +320,8 @@ def _options(context):
                                place_emitters=sp.place_emitters, terrain_detail=sp.terrain_detail,
                                terrain_lod=sp.terrain_lod, terrain_fade=sp.terrain_fade,
                                foliage_fade=sp.foliage_fade, sky=sp.sky, sky_strength=sp.sky_strength,
-                               collision=sp.collision, baked_lighting=sp.baked_lighting)
+                               collision=ip.import_collision, baked_lighting=ip.import_lightmaps,
+                               lower_lods=ip.import_lower_lods, pack_textures=ip.pack_textures)
 
 
 def _target_collection(context, name):
@@ -325,9 +384,11 @@ class MAG_OT_import(bpy.types.Operator):
                 rt = S.index.zrbs[asset.zrb].records[asset.rec][7]
                 coll = _target_collection(context, build._safe(asset.label))
                 if rt == build.T_SKINNED_MODEL:
-                    root = build.build_skinned(lib, asset.zrb, asset.rec, asset.label, opts, mcache, coll)
+                    root = build.build_skinned(lib, asset.zrb, asset.rec, asset.label, opts, mcache, coll,
+                                               lower_lods=opts.lower_lods)
                 else:
-                    root = build.build_model_objects(lib, asset.zrb, asset.rec, asset.label, opts, mcache, coll)
+                    root = build.build_model_objects(lib, asset.zrb, asset.rec, asset.label, opts, mcache, coll,
+                                                     lower_lods=opts.lower_lods)
                 root.location = context.scene.cursor.location
                 for ob in context.selected_objects:
                     ob.select_set(False)
@@ -438,8 +499,11 @@ class MAG_PT_options(bpy.types.Panel):
 
     def draw(self, context):
         sp = context.scene.mag
+        prefs = state.addon_prefs()  # None when registered by a script, not as an add-on
         col = self.layout.column()
         col.prop(sp, 'lod')
+        if prefs is not None:
+            col.prop(prefs, 'import_lower_lods', text='Lower LODs')
         col.prop(sp, 'materials')
         col.prop(sp, 'flip_green')
         col.prop(sp, 'skeleton')
@@ -455,9 +519,10 @@ class MAG_PT_options(bpy.types.Panel):
         sub.active = sp.include_terrain and sp.materials and sp.terrain_detail == 'FULL'
         sub.prop(sp, 'terrain_fade')
         col.prop(sp, 'instance_maps')
-        sub = col.column()
-        sub.active = sp.materials
-        sub.prop(sp, 'baked_lighting')
+        if prefs is not None:
+            sub = col.column()
+            sub.active = sp.materials
+            sub.prop(prefs, 'import_lightmaps', text='Lightmaps')
         col.prop(sp, 'place_emitters')
         col.prop(sp, 'include_foliage')
         sub = col.column()
@@ -469,22 +534,42 @@ class MAG_PT_options(bpy.types.Panel):
         sub = col.column()
         sub.active = sp.sky == 'WORLD'
         sub.prop(sp, 'sky_strength', text='Strength')
-        col.prop(sp, 'collision')
+        if prefs is not None:
+            col.prop(prefs, 'import_collision', text='Collision')
+            col.prop(prefs, 'pack_textures')
+            col.label(text='Lower LODs, Lightmaps, Collision, Pack: saved in Preferences',
+                      icon='PREFERENCES')
         col.separator()
+        col.operator('mag.pack_textures', icon='PACKAGE')
         col.operator('mag.clear_texture_cache', icon='TRASH')
 
 
 CLASSES = (MAG_AddonPreferences, MAG_AssetItem, MAG_WMProps, MAG_SceneProps, MAG_OT_select_iso, MAG_OT_scan,
-           MAG_OT_load_index, MAG_OT_clear_texture_cache, MAG_OT_import, MAG_UL_assets, MAG_PT_main, MAG_PT_options)
+           MAG_OT_load_index, MAG_OT_clear_texture_cache, MAG_OT_pack_textures, MAG_OT_import, MAG_UL_assets, MAG_PT_main, MAG_PT_options)
 
 
 def _startup_load():
+    """Restore saved options, reload the cached index and refill the asset list."""
     try:
-        if S.index is None and state.try_load_cached():
-            _refresh_list()
+        state.restore_import_prefs()
+        if S.index is None:
+            state.try_load_cached()
+        _refresh_list()
     except Exception:
         traceback.print_exc()
     return None
+
+
+@bpy.app.handlers.persistent
+def _on_load_post(*_args):
+    # opening a .blend brings its own window manager, whose asset list is empty or stale
+    _startup_load()
+    try:
+        n = state.relink_textures()
+        if n:
+            print('MAG: relinked %d textures to the cache in %s' % (n, state.cache_dir()))
+    except Exception:
+        traceback.print_exc()
 
 
 def register():
@@ -492,12 +577,16 @@ def register():
         bpy.utils.register_class(c)
     bpy.types.WindowManager.mag = PointerProperty(type=MAG_WMProps)
     bpy.types.Scene.mag = PointerProperty(type=MAG_SceneProps)
-    bpy.app.timers.register(_startup_load, first_interval=0.5)
+    bpy.app.timers.register(_startup_load, first_interval=0.5, persistent=True)
+    if _on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_load_post)
 
 
 def unregister():
     if bpy.app.timers.is_registered(_startup_load):
         bpy.app.timers.unregister(_startup_load)
+    if _on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load_post)
     del bpy.types.Scene.mag
     del bpy.types.WindowManager.mag
     for c in reversed(CLASSES):

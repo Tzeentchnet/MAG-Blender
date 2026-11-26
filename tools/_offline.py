@@ -1,7 +1,7 @@
 """Helpers for scripts that read the disc outside Blender, using the importer's cached index.
 
-The index is the one the add-on writes (``%APPDATA%/Blender Foundation/Blender/5.2/config/
-mag_importer/mag_index.pkl``); pass ``--index`` to a script to use another one.
+The index is the one the add-on writes (``%APPDATA%/Blender Foundation/Blender/mag_importer/
+mag_index.pkl``); pass ``--index`` to a script to use another one.
 """
 import os
 import sys
@@ -11,7 +11,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from mag_importer.core import catalog, library  # noqa: E402
 from mag_importer.core.zrb import Zrb  # noqa: E402
 
-DEFAULT_CACHE = os.path.expandvars(r'%APPDATA%\Blender Foundation\Blender\5.2\config\mag_importer')
+_BLENDER_USER = os.path.expandvars(r'%APPDATA%\Blender Foundation\Blender')
+DEFAULT_CACHE = os.path.join(_BLENDER_USER, 'mag_importer')  # shared by all Blender versions
+if not os.path.exists(os.path.join(DEFAULT_CACHE, 'mag_index.pkl')):  # not migrated yet
+    DEFAULT_CACHE = os.path.join(_BLENDER_USER, '5.2', 'config', 'mag_importer')
 DEFAULT_ISO = r'F:\Recomp_GameSource\MAG (USA)\MAG (USA).dec.iso'
 
 

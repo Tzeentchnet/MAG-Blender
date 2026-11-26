@@ -16,7 +16,7 @@ from mathutils import Matrix, Quaternion
 from ..core import foliage as fol
 from ..core import level as lvl
 from ..core import lighting as lit
-from ..core.materials import VERTEX_LIT
+from ..core.materials import VERTEX_LIT, WATER_COLOR
 from ..core.library import skeleton_world, fit_score
 from ..core.zrb import T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL, T_FOLIAGE_BATCH
 
@@ -73,6 +73,8 @@ class ImportOptions:
         self.sky_strength = 1.0
         self.collision = False         # import the map's collision meshes (physics.zrb)
         self.baked_lighting = True     # apply the map's baked per-vertex lighting (84DFB280)
+        self.lower_lods = False        # also import the coarser LODs (hidden sub-collections)
+        self.pack_textures = False     # pack the cached DDS files into the .blend
         self.__dict__.update(kw)
 
 
@@ -85,6 +87,55 @@ def _select_meshes(model, geoms, lod):
             if chosen:
                 break
     return set(chosen)
+
+
+def _extra_lods(model, geoms, keep, lod):
+    """[(lod, mesh index set)] for every LOD coarser than ``lod`` whose meshes differ from ``keep``."""
+    bits = 0
+    for i, me in enumerate(model.meshes):
+        if geoms[i] is not None:
+            bits |= me.lod_mask
+    out = []
+    for k in range(lod + 1, 8):
+        if not bits >> k & 1:
+            continue
+        ids = {i for i, me in enumerate(model.meshes)
+               if geoms[i] is not None and (me.lod_mask & (1 << k) or me.lod_mask == 0)}
+        if ids and ids != keep:
+            out.append((k, ids))
+    return out
+
+
+def _find_layer_collection(lc, coll):
+    if lc.collection == coll:
+        return lc
+    for child in lc.children:
+        hit = _find_layer_collection(child, coll)
+        if hit is not None:
+            return hit
+    return None
+
+
+class _LodCollections:
+    """One child collection per extra LOD (``<parent>_LOD<n>``), hidden in viewport and render."""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.colls = {}
+
+    def get(self, k):
+        c = self.colls.get(k)
+        if c is None:
+            c = bpy.data.collections.new('%s_LOD%d' % (self.parent.name, k))
+            self.parent.children.link(c)
+            c.hide_render = True
+            lc = _find_layer_collection(bpy.context.view_layer.layer_collection, c)
+            if lc is not None:  # the eye toggle, so one click shows the whole LOD
+                lc.hide_viewport = True
+            else:  # parent not in this view layer: fall back to the global toggle
+                c.hide_viewport = True
+            self.colls[k] = c
+        return c
 
 
 # -- meshes --------------------------------------------------------------------------------------
@@ -155,6 +206,11 @@ def _preview_image(col):
     return img
 
 
+# Bump when the material build changes: a .blend's materials built by an older importer are then
+# rebuilt instead of reused.
+MATERIAL_VERSION = 2
+
+
 class MaterialCache:
     def __init__(self, lib, opts):
         self.lib = lib
@@ -190,6 +246,11 @@ class MaterialCache:
                 if non_color:
                     img.colorspace_settings.name = 'Non-Color'
                     img.alpha_mode = 'CHANNEL_PACKED'
+            if getattr(self.opts, 'pack_textures', False) and img.packed_file is None:
+                try:
+                    img.pack()
+                except RuntimeError as e:
+                    print('MAG: could not pack %s: %s' % (nm, e))
         self.images[key] = (img, meta)
         return img, meta
 
@@ -200,7 +261,8 @@ class MaterialCache:
         mode = self.opts.terrain_detail
         baked = bool(self.opts.baked_lighting)
         mat = next((m for m in bpy.data.materials if m.get('mag_hash') == '%08x' % h
-                    and m.get('mag_terrain', mode) == mode and m.get('mag_baked', baked) == baked), None)
+                    and m.get('mag_terrain', mode) == mode and m.get('mag_baked', baked) == baked
+                    and m.get('mag_v', 0) == MATERIAL_VERSION), None)
         if mat is None:
             mat = self._build(h, near, name)
         self.mats[h] = mat
@@ -218,6 +280,9 @@ class MaterialCache:
             return mat
         info, mzrb = out
         self._flags[h] = info.flags
+        mat['mag_v'] = MATERIAL_VERSION
+        if info.parsed:
+            mat['mag_technique'] = '%08x' % info.technique
         if info.flags & VERTEX_LIT:
             mat['mag_baked'] = bool(self.opts.baked_lighting)
         if info.terrain is not None:
@@ -229,22 +294,55 @@ class MaterialCache:
         links = nt.links
         y = 600
         base_node = None
+        # the game's UV transform of the base maps: uv' = uv * s + o (V flipped in Blender)
+        uvt = info.uv_transform()
+        base_uv = None
+        if uvt:
+            su, sv, ou, ov = uvt
+            uvn = nt.nodes.new('ShaderNodeUVMap')
+            uvn.uv_map, uvn.location = 'UVMap', (-1700, 300)
+            mp = nt.nodes.new('ShaderNodeMapping')
+            mp.location, mp.label = (-1500, 300), 'Material UV transform'
+            mp.inputs['Scale'].default_value = (su, sv, 1.0)
+            mp.inputs['Location'].default_value = (ou, 1.0 - sv - ov, 0.0)
+            links.new(uvn.outputs['UV'], mp.inputs['Vector'])
+            base_uv = mp.outputs['Vector']
+            mat['mag_uv_transform'] = list(uvt)
         if 3 in b:
             img, meta = self.image(b[3], mzrb)
             if img:
                 n = nt.nodes.new('ShaderNodeTexImage')
                 n.image, n.label, n.location = img, 'Base Color', (-500, y)
-                links.new(n.outputs['Color'], bsdf.inputs['Base Color'])
-                if meta.get('alpha'):
-                    links.new(n.outputs['Alpha'], bsdf.inputs['Alpha'])
+                if base_uv is not None:
+                    links.new(base_uv, n.inputs['Vector'])
+                color = n.outputs['Color']
+                if info.alpha_test or (not info.parsed and meta.get('alpha')):
+                    # alpha test: drawn where alpha >= reference (header +0x09); the fallback
+                    # (unparsed header) keeps the old texture-alpha guess with a 0.5 threshold
+                    ref = info.alpha_ref if info.alpha_test else 128
+                    cut = nt.nodes.new('ShaderNodeMath')
+                    cut.operation, cut.location, cut.label = 'GREATER_THAN', (-200, y - 200), 'Alpha test'
+                    links.new(n.outputs['Alpha'], cut.inputs[0])
+                    cut.inputs[1].default_value = (ref - 0.5) / 255.0
+                    links.new(cut.outputs[0], bsdf.inputs['Alpha'])
                     mat.surface_render_method = 'DITHERED'
+                    mat['mag_alpha_ref'] = ref
+                elif info.translucent and meta.get('alpha'):
+                    links.new(n.outputs['Alpha'], bsdf.inputs['Alpha'])
+                    mat.surface_render_method = 'BLENDED'
+                color = self._detail_color(mat, info, mzrb, color, y)
+                links.new(color, bsdf.inputs['Base Color'])
                 base_node = n
             y -= 300
+        if info.translucent:
+            mat['mag_translucent'] = True
         if 5 in b:
             img, _ = self.image(b[5], mzrb, non_color=False)
             if img:
                 n = nt.nodes.new('ShaderNodeTexImage')
                 n.image, n.label, n.location = img, 'Specular (gloss in A)', (-500, y)
+                if base_uv is not None:
+                    links.new(base_uv, n.inputs['Vector'])
                 bw = nt.nodes.new('ShaderNodeRGBToBW')
                 bw.location = (-200, y)
                 links.new(n.outputs['Color'], bw.inputs[0])
@@ -255,21 +353,24 @@ class MaterialCache:
                 links.new(n.outputs['Alpha'], inv.inputs[1])
                 links.new(inv.outputs[0], bsdf.inputs['Roughness'])
             y -= 300
+        normals = []  # (x, y) sockets in -1..1, summed (the detail normal adds to the base one)
         if 4 in b:
             img, meta = self.image(b[4], mzrb, non_color=True)
             if img:
-                if meta.get('dxt5nm', True):
-                    self._normal_map(nt, img, bsdf, y)
-                else:  # ordinary RGB tangent-space normal map
-                    tex = nt.nodes.new('ShaderNodeTexImage')
-                    tex.image, tex.label, tex.location = img, 'Normal (RGB)', (-500, y)
-                    nm = nt.nodes.new('ShaderNodeNormalMap')
-                    nm.location, nm.uv_map = (-200, y), 'UVMap'
-                    links.new(tex.outputs['Color'], nm.inputs['Color'])
-                    links.new(nm.outputs[0], bsdf.inputs['Normal'])
+                normals.append(self._normal_xy(nt, img, meta.get('dxt5nm', True), 'Normal', base_uv, y))
             y -= 400
+        detail_normal = 16 in b and info.detail_scale(16)
+        if detail_normal:
+            img, meta = self.image(b[16], mzrb, non_color=True)
+            if img:
+                vec = self._detail_uv(nt, info.detail_scale(16), 'Detail normal', y)
+                normals.append(self._normal_xy(nt, img, meta.get('dxt5nm', True), 'Detail normal', vec, y))
+                mat['mag_detail_normal'] = list(info.detail_scale(16))
+            y -= 400
+        if normals:
+            self._normal_out(nt, bsdf, normals, y)
         for slot, label in ((15, 'Emissive/Mask'), (16, 'Detail Normal'), (17, 'Detail Color'), (255, 'Mask')):
-            if slot in b:
+            if slot in b and not (slot == 16 and detail_normal) and not (slot == 17 and 'mag_detail_color' in mat):
                 img, _ = self.image(b[slot], mzrb, non_color=slot != 17)
                 if img:
                     n = nt.nodes.new('ShaderNodeTexImage')
@@ -277,21 +378,33 @@ class MaterialCache:
                     y -= 300
         if info.flags & VERTEX_LIT and self.opts.baked_lighting:
             _apply_baked_light(nt, bsdf)
+        if info.glass:
+            # glass technique (normal + environment map, no colour texture): a clear blended surface
+            bsdf.inputs['Base Color'].default_value = (0.8, 0.85, 0.9, 1.0)
+            bsdf.inputs['Roughness'].default_value = 0.05
+            bsdf.inputs['Alpha'].default_value = 0.2
+            mat.surface_render_method = 'BLENDED'
+            mat.diffuse_color = (0.6, 0.7, 0.8, 0.3)
+            mat['mag_glass'] = True
+        elif info.water or (not info.parsed and 3 not in b and 4 in b):
+            # water technique; the fallback (unparsed header) keeps the old "normal map but no
+            # colour" rule. The technique's colour parameter looks like the deep-water colour.
+            wc = info.constant(WATER_COLOR) if info.water else None
+            rgb = tuple(wc[:3]) if wc and len(wc) == 4 else (0.015, 0.035, 0.04)
+            bsdf.inputs['Base Color'].default_value = rgb + (1.0,)
+            bsdf.inputs['Roughness'].default_value = 0.05
+            mat.diffuse_color = (0.04, 0.08, 0.1, 1.0)
+            mat['mag_water'] = True
         # the viewport's Texture colour mode and texture painting show the active image node
         if base_node is not None:
             nt.nodes.active = base_node
         else:
-            # no colour texture: normal-only surfaces in MAG are water/liquid shaders
-            if 4 in b:
-                bsdf.inputs['Base Color'].default_value = (0.015, 0.035, 0.04, 1.0)
-                bsdf.inputs['Roughness'].default_value = 0.05
-                mat.diffuse_color = (0.04, 0.08, 0.1, 1.0)
-                mat['mag_water'] = True
             nt.nodes.active = bsdf
             # Workbench's Texture mode draws an image node regardless (the normal or specular
             # map), so give it an unconnected 1x1 image of the base colour to draw instead
             if any(n.type == 'TEX_IMAGE' for n in nt.nodes):
-                col = mat.diffuse_color if 4 in b else bsdf.inputs['Base Color'].default_value
+                col = mat.diffuse_color if (mat.get('mag_water') or mat.get('mag_glass')) \
+                    else bsdf.inputs['Base Color'].default_value
                 n = nt.nodes.new('ShaderNodeTexImage')
                 n.image = _preview_image(col)
                 n.label, n.location = 'Viewport colour (unconnected)', (-500, 900)
@@ -351,50 +464,100 @@ class MaterialCache:
         nt.nodes.active = mac
         mat['mag_layers'] = ['%08x' % h for h in t.colors]
 
-    def _normal_map(self, nt, img, bsdf, y):
-        """DXT5nm: X in alpha, Y in green; rebuild Z."""
+    def _math(self, nt, op, a, b=None, loc=(0, 0), c=None):
+        n = nt.nodes.new('ShaderNodeMath')
+        n.operation = op
+        n.location = loc
+        for i, v in enumerate((a, b, c)):
+            if v is None:
+                continue
+            if isinstance(v, (int, float)):
+                n.inputs[i].default_value = v
+            else:
+                nt.links.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    def _normal_xy(self, nt, img, dxt5nm, label, vector, y):
+        """Tangent-space X and Y (-1..1) of a normal map: DXT5nm keeps X in alpha and Y in green,
+        an RGB map X in red."""
         links = nt.links
         tex = nt.nodes.new('ShaderNodeTexImage')
-        tex.image, tex.label, tex.location = img, 'Normal (DXT5nm)', (-1100, y)
+        tex.image, tex.location = img, (-1100, y)
+        tex.label = '%s (%s)' % (label, 'DXT5nm' if dxt5nm else 'RGB')
+        if vector is not None:
+            links.new(vector, tex.inputs['Vector'])
         sep = nt.nodes.new('ShaderNodeSeparateColor')
         sep.location = (-800, y)
         links.new(tex.outputs['Color'], sep.inputs[0])
-
-        def math(op, a, b=None, loc=(0, 0)):
-            n = nt.nodes.new('ShaderNodeMath')
-            n.operation = op
-            n.location = loc
-            for i, v in enumerate((a, b)):
-                if v is None:
-                    continue
-                if isinstance(v, (int, float)):
-                    n.inputs[i].default_value = v
-                else:
-                    links.new(v, n.inputs[i])
-            return n.outputs[0]
-        x = math('MULTIPLY_ADD', tex.outputs['Alpha'], 2.0, (-800, y - 200))
-        x.node.inputs[2].default_value = -1.0
+        xs = tex.outputs['Alpha'] if dxt5nm else sep.outputs['Red']
+        x = self._math(nt, 'MULTIPLY_ADD', xs, 2.0, (-650, y - 200), -1.0)
         g = sep.outputs['Green']
         if self.opts.flip_green:
-            g = math('SUBTRACT', 1.0, g, (-650, y + 80))
-        yy = math('MULTIPLY_ADD', g, 2.0, (-650, y - 60))
-        yy.node.inputs[2].default_value = -1.0
-        x2 = math('MULTIPLY', x, x, (-500, y - 200))
-        y2 = math('MULTIPLY', yy, yy, (-500, y - 60))
-        s = math('ADD', x2, y2, (-350, y - 120))
-        z = math('SQRT', math('MAXIMUM', math('SUBTRACT', 1.0, s, (-200, y - 120)), 0.0, (-50, y - 120)), None, (100, y - 120))
-        zc = math('MULTIPLY_ADD', z, 0.5, (250, y - 120))
-        zc.node.inputs[2].default_value = 0.5
+            g = self._math(nt, 'SUBTRACT', 1.0, g, (-650, y + 80))
+        yy = self._math(nt, 'MULTIPLY_ADD', g, 2.0, (-650, y - 60), -1.0)
+        return x, yy
+
+    def _normal_out(self, nt, bsdf, normals, y):
+        """Sum the maps' X and Y (the detail normal adds to the base one, as in UDN blending),
+        rebuild Z from the first map, and feed a Normal Map node (which normalises)."""
+        x, yy = normals[0]
+        z = self._math(nt, 'SQRT', self._math(nt, 'MAXIMUM', self._math(
+            nt, 'SUBTRACT', 1.0, self._math(nt, 'ADD', self._math(nt, 'MULTIPLY', x, x, (-500, y - 200)),
+                                            self._math(nt, 'MULTIPLY', yy, yy, (-500, y - 60)), (-350, y - 120)),
+            (-200, y - 120)), 0.0, (-50, y - 120)), None, (100, y - 120))
+        for k, (dx, dy) in enumerate(normals[1:]):
+            x = self._math(nt, 'ADD', x, dx, (-350, y - 300 - 80 * k))
+            yy = self._math(nt, 'ADD', yy, dy, (-350, y - 340 - 80 * k))
         comb = nt.nodes.new('ShaderNodeCombineColor')
         comb.location = (400, y)
-        links.new(tex.outputs['Alpha'], comb.inputs[0])
-        links.new(g, comb.inputs[1])
-        links.new(zc, comb.inputs[2])
+        nt.links.new(self._math(nt, 'MULTIPLY_ADD', x, 0.5, (250, y + 60), 0.5), comb.inputs[0])
+        nt.links.new(self._math(nt, 'MULTIPLY_ADD', yy, 0.5, (250, y - 40), 0.5), comb.inputs[1])
+        nt.links.new(self._math(nt, 'MULTIPLY_ADD', z, 0.5, (250, y - 120), 0.5), comb.inputs[2])
         nm = nt.nodes.new('ShaderNodeNormalMap')
         nm.location = (550, y)
         nm.uv_map = 'UVMap'
-        links.new(comb.outputs[0], nm.inputs['Color'])
-        links.new(nm.outputs[0], bsdf.inputs['Normal'])
+        nt.links.new(comb.outputs[0], nm.inputs['Color'])
+        nt.links.new(nm.outputs[0], bsdf.inputs['Normal'])
+
+    def _detail_uv(self, nt, scale, label, y):
+        """UV0 scaled by a detail map's scale (the same V flip as the material UV transform)."""
+        uvn = nt.nodes.new('ShaderNodeUVMap')
+        uvn.uv_map, uvn.location = 'UVMap', (-1700, y)
+        mp = nt.nodes.new('ShaderNodeMapping')
+        mp.location, mp.label = (-1500, y), '%s UV (x%g, x%g)' % (label, scale[0], scale[1])
+        mp.inputs['Scale'].default_value = (scale[0], scale[1], 1.0)
+        mp.inputs['Location'].default_value = (0.0, (1.0 - scale[1]) % 1.0, 0.0)
+        nt.links.new(uvn.outputs['UV'], mp.inputs['Vector'])
+        return mp.outputs['Vector']
+
+    def _detail_color(self, mat, info, mzrb, color, y):
+        """Modulate the base colour by the detail colour (slot 17), 2x around mid-grey. The game
+        presumably does this on gamma-space values, so the factor is raised to 2.2 here."""
+        scale = info.detail_scale(17)
+        if not scale:
+            return color
+        img, _ = self.image(info.bindings[17], mzrb, non_color=True)
+        if not img:
+            return color
+        nt = mat.node_tree
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.image, tex.label, tex.location = img, 'Detail colour', (-500, y + 300)
+        nt.links.new(self._detail_uv(nt, scale, 'Detail colour', y + 300), tex.inputs['Vector'])
+        two = nt.nodes.new('ShaderNodeVectorMath')
+        two.operation, two.location = 'SCALE', (-250, y + 300)
+        two.inputs['Scale'].default_value = 2.0
+        nt.links.new(tex.outputs['Color'], two.inputs[0])
+        gam = nt.nodes.new('ShaderNodeGamma')
+        gam.location = (-100, y + 300)
+        gam.inputs['Gamma'].default_value = 2.2
+        nt.links.new(two.outputs[0], gam.inputs['Color'])
+        mix = nt.nodes.new('ShaderNodeMix')
+        mix.data_type, mix.blend_type, mix.location = 'RGBA', 'MULTIPLY', (50, y + 150)
+        mix.inputs['Factor'].default_value = 1.0
+        nt.links.new(color, mix.inputs['A'])
+        nt.links.new(gam.outputs[0], mix.inputs['B'])
+        mat['mag_detail_color'] = list(scale)
+        return mix.outputs['Result']
 
 
 LIGHT_ATTR = 'mag_light'   # per-vertex (sky, sun, 0, 1) of the placement's baked lighting
@@ -609,27 +772,40 @@ def terrain_group(flip_green=False):
 
 
 # -- static / level models ---------------------------------------------------------------------------
-def build_model_objects(lib, zi, ri, label, opts, mcache, collection):
-    """Create objects for a (non-skinned or skinned-as-static) model. Returns the root object."""
+def _mesh_parts(model, geoms, mesh_ids, mcache, zi):
+    """(parts, materials) for make_mesh: one material slot per distinct material hash."""
+    slot_of, mats, parts = {}, [], []
+    for i in mesh_ids:
+        mh = model.meshes[i].material
+        if mh not in slot_of:
+            slot_of[mh] = len(mats)
+            mats.append(mcache.get(mh, zi))
+        parts.append((geoms[i], slot_of[mh]))
+    return parts, mats
+
+
+def _lod_name(name, k):
+    return '%s_LOD%d' % (_safe(name, 54), k)
+
+
+def build_model_objects(lib, zi, ri, label, opts, mcache, collection, lower_lods=False):
+    """Create objects for a (non-skinned or skinned-as-static) model. Returns the root object.
+
+    ``lower_lods``: also build the coarser LODs, in one hidden ``<collection>_LOD<n>`` child
+    collection each, parented to their node's object."""
     model, geoms = lib.model(zi, ri)
     keep = _select_meshes(model, geoms, opts.lod)
-    mats_used = []
+    extra = _extra_lods(model, geoms, keep, opts.lod) if lower_lods else []
+    lod_colls = _LodCollections(collection) if extra else None
     objs = {}
     root = None
     single = len(model.nodes) == 1
     for node in model.nodes:
-        mesh_ids = [i for i in range(node.mesh_start, node.mesh_start + node.mesh_count) if i in keep]
+        span = range(node.mesh_start, node.mesh_start + node.mesh_count)
+        mesh_ids = [i for i in span if i in keep]
         name = label if single else '%s.%s' % (label, lib.index.label(node.name, 'node%d' % node.index))
         if mesh_ids:
-            slot_of = {}
-            mats = []
-            parts = []
-            for i in mesh_ids:
-                mh = model.meshes[i].material
-                if mh not in slot_of:
-                    slot_of[mh] = len(mats)
-                    mats.append(mcache.get(mh, zi))
-                parts.append((geoms[i], slot_of[mh]))
+            parts, mats = _mesh_parts(model, geoms, mesh_ids, mcache, zi)
             me = make_mesh(_safe(name), parts, mats)
             if opts.baked_lighting and any(mcache.vertex_lit(model.meshes[i].material, zi) for i in mesh_ids):
                 set_light(me, np.ones((len(me.vertices), 2), np.float32))
@@ -650,6 +826,16 @@ def build_model_objects(lib, zi, ri, label, opts, mcache, collection):
             ob.parent = objs[node.parent]
         elif root is None:
             root = ob
+        for k, ids in extra:
+            lod_ids = [i for i in span if i in ids]
+            if not lod_ids or lod_ids == mesh_ids:
+                continue
+            parts, mats = _mesh_parts(model, geoms, lod_ids, mcache, zi)
+            lob = bpy.data.objects.new(_lod_name(name, k), make_mesh(_lod_name(name, k), parts, mats))
+            lob['mag_lod'] = k
+            lob.parent = ob
+            lob.matrix_parent_inverse = Matrix.Identity(4)
+            lod_colls.get(k).objects.link(lob)
     # prune empty leaf nodes (attachment helpers) to keep the outliner tidy
     for idx in sorted(objs, reverse=True):
         ob = objs[idx]
@@ -717,28 +903,8 @@ def choose_skeleton(lib, geoms, wanted='AUTO'):
     return best
 
 
-def build_skinned(lib, zi, ri, label, opts, mcache, collection):
-    model, geoms = lib.model(zi, ri)
-    keep = sorted(_select_meshes(model, geoms, opts.lod))
-    parts, mats, slot_of = [], [], {}
-    for i in keep:
-        mh = model.meshes[i].material
-        if mh not in slot_of:
-            slot_of[mh] = len(mats)
-            mats.append(mcache.get(mh, zi))
-        parts.append((geoms[i], slot_of[mh]))
-    me = make_mesh(_safe(label), parts, mats)
-    ob = bpy.data.objects.new(_safe(label), me)
-    collection.objects.link(ob)
-    skel = choose_skeleton(lib, [g for g, _ in parts], opts.skeleton)
-    if skel is None:
-        return ob
-    arm_ob = None
-    act = bpy.context.view_layer.objects.active
-    if act is not None and act.type == 'ARMATURE' and act.get('mag_skeleton') == skel.name:
-        arm_ob = act
-    if arm_ob is None:
-        arm_ob = build_armature(skel, collection, '%s_rig' % _safe(label, 50))
+def _skin(ob, parts, arm_ob):
+    """Vertex groups from the parts' joints/weights and an Armature modifier; parents ob to arm_ob."""
     names = list(arm_ob['mag_bones'])
     # vertex groups: sum weights per (vertex, bone), then add per distinct weight value
     J = np.concatenate([g.joints for g, _ in parts if g.joints is not None]) if all(g.joints is not None for g, _ in parts) else None
@@ -762,7 +928,34 @@ def build_skinned(lib, zi, ri, label, opts, mcache, collection):
     ob.parent = arm_ob
     mod = ob.modifiers.new('Armature', 'ARMATURE')
     mod.object = arm_ob
+
+
+def build_skinned(lib, zi, ri, label, opts, mcache, collection, lower_lods=False):
+    model, geoms = lib.model(zi, ri)
+    keep = _select_meshes(model, geoms, opts.lod)
+    parts, mats = _mesh_parts(model, geoms, sorted(keep), mcache, zi)
+    me = make_mesh(_safe(label), parts, mats)
+    ob = bpy.data.objects.new(_safe(label), me)
+    collection.objects.link(ob)
+    skel = choose_skeleton(lib, [g for g, _ in parts], opts.skeleton)
+    if skel is None:
+        return ob
+    arm_ob = None
+    act = bpy.context.view_layer.objects.active
+    if act is not None and act.type == 'ARMATURE' and act.get('mag_skeleton') == skel.name:
+        arm_ob = act
+    if arm_ob is None:
+        arm_ob = build_armature(skel, collection, '%s_rig' % _safe(label, 50))
+    _skin(ob, parts, arm_ob)
     ob['mag_model'] = '%08x' % model.name
+    extra = _extra_lods(model, geoms, keep, opts.lod) if lower_lods else []
+    lod_colls = _LodCollections(collection) if extra else None
+    for k, ids in extra:
+        lparts, lmats = _mesh_parts(model, geoms, sorted(ids), mcache, zi)
+        lob = bpy.data.objects.new(_lod_name(label, k), make_mesh(_lod_name(label, k), lparts, lmats))
+        lob['mag_lod'] = k
+        lod_colls.get(k).objects.link(lob)
+        _skin(lob, lparts, arm_ob)
     return arm_ob
 
 

@@ -33,9 +33,22 @@ You can also use *Add-ons → Install…* for a legacy install. Either way the p
 
 ### Options (Import Options sub-panel)
 
+**Lower LODs**, **Lightmaps**, **Collision** and **Pack Textures** are add-on preferences (*Edit → Preferences →
+Add-ons → MAG Importer*, also shown in the sub-panel), so they keep their value across files and
+restarts. The other options are stored per scene.
+
 * **LOD**: the level of detail to import, from 0 (highest) to 3.
-* **Materials**: Principled BSDF materials with base colour, normal maps and specular/gloss.
-  Normal maps can be DXT5nm or RGB; the add-on detects which.
+* **Pack Textures** (off by default): packs the imported textures into the .blend so it works on
+  another computer or after the texture cache is cleared, at the cost of a bigger file. **Pack
+  MAG Textures** (bottom of the sub-panel) packs the textures of an earlier import.
+* **Lower LODs** (off by default): models and characters also get every coarser LOD than the one
+  above, in hidden `<name>_LOD1`, `_LOD2`... child collections (show one with its eye icon). LOD
+  objects are parented to their node; character LODs are skinned to the same armature. Maps
+  always use a single LOD.
+* **Materials**: Principled BSDF materials with base colour, normal maps, specular/gloss and
+  detail normal/colour maps, built from the material record's header: alpha test with the game's
+  reference, blended glass and other translucent surfaces, water, and the material's UV
+  transform. Normal maps can be DXT5nm or RGB; the add-on detects which.
 * **Flip Normal Green**: inverts the Y channel of the normal maps.
 * **Skeleton**: *Automatic* scores each skeleton's bind pose against the mesh, or you can force one.
 * **Set Scene to 30 fps**: MAG animations are authored at 30 fps.
@@ -51,7 +64,7 @@ You can also use *Add-ons → Install…* for a legacy install. Either way the p
     pattern from far away. 0 turns it off. It is shared by all terrain: change it later in the
     *Macro Fade Start* / *End* value nodes inside the *MAG Terrain* node group.
 * **Collection Instances**: turn this off to get linked mesh duplicates instead of instances.
-* **Baked Lighting** (on by default): applies the lighting the game baked into the vertices of
+* **Lightmaps** (on by default): applies the lighting the game baked into the vertices of
   some placements (mostly trees and bushes, a few hundred to 3,500 per map). Each lit placement
   becomes plain objects with its own mesh copies (`mag_lighting` custom property) carrying a
   `mag_light` colour attribute: sun visibility in G (0 in shadow), a sky/ambient term in R. Their
@@ -67,19 +80,28 @@ You can also use *Add-ons → Install…* for a legacy install. Either way the p
   of one mesh per shape). They are drawn as orange wireframe and hidden from renders; the
   collision includes the invisible boundary walls around the playable area.
 
-## The cache survives restarts and resets
+## The cache survives restarts, upgrades and resets
 
 The index (`mag_index.pkl`, about 14 MB) and the converted textures are stored in Blender's
-per-user config folder, for example
-`%APPDATA%\Blender Foundation\Blender\5.2\config\mag_importer\`. The ISO path is saved there too,
-in `settings.json`. As a result:
+per-user folder, next to the per-version folders rather than inside one, for example
+`%APPDATA%\Blender Foundation\Blender\mag_importer\`. The ISO path is saved there too, in
+`settings.json`. As a result:
 
-* restarting Blender reloads the index automatically, in about 0.1 s;
+* restarting Blender reloads the index automatically, in about 0.1 s, and opening a .blend
+  refills the asset list;
+* upgrading Blender (5.2 to 5.3...) keeps the cache: every version uses the same folder;
+* the import options kept in the preferences (Lower LODs, Lightmaps, Collision, Pack Textures)
+  are mirrored into `settings.json`, so they come back even if Blender's preferences are not
+  saved;
 * *Load Factory Settings* and reinstalling the add-on keep it;
 * if the ISO changes (path, size or modification time), you are asked to rescan.
 
 Textures are converted to DDS once and then reused. DXT data is stored unchanged, so Blender's
 GPU decodes it. Preferences can move the cache to another folder.
+
+Older versions of the add-on kept the cache in `...\Blender\<version>\config\mag_importer\`. The
+first start moves the newest such cache to the shared folder. Opening a .blend whose textures
+point at a cache location that no longer exists relinks them to the current cache.
 
 ## Speed
 
@@ -105,7 +127,7 @@ mag_importer/
     models.py      model records, RSX vertex buffers, Edge partitions, skinning palettes
     vertex.py      vectorised attribute codecs
     textures.py    GCM textures -> DDS, DXT/ARGB decoders, un-swizzle
-    materials.py   texture bindings
+    materials.py   material header, texture bindings, shader constants
     havok.py       Havok 6.x packfiles, skeletons, spline-compressed animations
     props.py       reflected property objects (.zpr tables, .clv)
     level.py       map instance placements
@@ -132,6 +154,10 @@ tools/             validation and test scripts (see below)
   format, indices, positions, normals/tangents, influences and format tables. The skin palette
   is `skinMatricesByteOffsets[2]` at h10/h11 and `skinMatricesSizes[2]` at h12/h13, as 48-byte
   3×4 matrices.
+* **Materials**: a 0x80-byte header (alpha test + reference, render group bits, technique hash,
+  binding count, vertex attributes), 14-byte texture bindings, then `0xDEADBEEF`-tagged engine
+  parameters, constant parameters with their float values, and pass records. Constants have no
+  names; their meaning is per technique (62 on the disc).
 * **Textures**: GCM format 5/6/7/8 = A8R8G8B8/DXT1/DXT3/DXT5. Pitch 0 means a swizzled (Morton)
   ARGB texture.
 * **Animations**: Havok 6.5 `hkaSplineCompressedAnimation`. The block data is little-endian even
@@ -172,11 +198,13 @@ tools/             validation and test scripts (see below)
   texture with a planar projection that may be mirrored or turned compared with the game. Fix
   it in the World's *Sky Rotation* node if a sun or landmark disagrees. The sky's fog and tint
   values are not used.
-* Materials map the main texture slots to a Principled BSDF. The other slots (detail, masks,
-  environment) are added as unconnected image nodes so you can wire them in.
-* Materials with a normal map but no colour texture are treated as water and get a dark, glossy
-  base. This also catches a few small props, which then render dark. Workbench's *Texture* mode
-  draws them from an unconnected 1×1 *Viewport colour* image.
+* Materials map the main texture slots to a Principled BSDF. Emissive, mask and environment
+  slots are added as unconnected image nodes so you can wire them in. Most shader constants
+  (specular colours and exponents, tints) have no known meaning yet and are not used.
+* Water and glass are recognised by their shader. Water gets a glossy base in the material's
+  water colour, glass a clear blended surface; neither reproduces the game's reflections or
+  refraction. Workbench's *Texture* mode draws them from an unconnected 1×1 *Viewport colour*
+  image.
 
 ## Developer tools
 
