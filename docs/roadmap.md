@@ -314,18 +314,39 @@ wanted.
 
 ### Follow-ups
 
-* **Unknown layouts.** 1,323 records (6 %, 16 model hashes) are longer than the vertex-lit meshes:
-  Baku's most common tree `5552a9be` (544 entries for 532 vertices; the last mesh is at the end,
-  the first two take 492 entries instead of 480) and Unalaska's `86c25738` (every lit mesh twice,
-  the second copy reordered). They are skipped. The seam test can locate meshes that have seams;
-  the leaf-card meshes without seams need another clue (perhaps the Edge output order or
-  per-LOD duplication).
+* ~~**Unknown layouts.**~~ **Done** (see below).
 * **The game's formula.** How `sky` and `sun` combine with the sun colour, the ambient colour and
   the texture is not decoded (the vertex/fragment programs of the vertex-lit technique would tell).
   The weights are a calibration.
 * **Bytes 0 and 2** of each entry are almost always 0 (equal to each other when not).
 * **Sun direction.** `sun` does not follow N·L for one direction, so it does not give the sun
   direction for the sky orientation follow-up directly; the shadow directions might.
+
+### Other lighting layouts — done
+
+The 6 % of records longer than their model's vertex-lit meshes are now imported, so every lit
+placement on the disc gets its lighting (Baku's most common tree `5552a9be` included).
+
+* One record (`94727d6f`, Cosmodrome) only looked longer: its Edge partitions decode to 1,327
+  vertices against 1,324 in the mesh header, and N follows the decoded count.
+* The other 15 models keep their lit meshes in mesh order with extra entries between them, a
+  layout shared by every placement and by model families across maps (table in
+  [properties-and-levels.md](formats/properties-and-levels.md#baked-lighting-84dfb280)). The extra
+  entries look like bakes of an earlier export; they are not used.
+* `lighting.fit_layout` finds each lit mesh's offset from the data: at the right offset each
+  vertex's value is close to its 3 nearest vertices' (equal across seams). It picks offsets in
+  mesh order without overlap by dynamic programming over the cost relative to each mesh's median,
+  and accepts the fit only when every mesh is at most 0.75 of its median. Leaf cards without seams
+  locate this way too, which the seam test alone could not do.
+* `build._MapLighting` fits once per model and record length on import, from up to 64 of the
+  level's records, and prints the fit to the console. `tools/lighting_check.py` fits the same way
+  and seam-tests the fitted records: 100 % of records are covered on all 15 levels and every level
+  passes. `map_test.py … light` passes on Baku (1,052 lit, 396 fitted), Kennicott (1,022 / 137) and
+  Cosmodrome (1,820 / 59), with no record skipped.
+* Control: inserting random gaps into the records of models that do match recovers the true
+  offsets for 213 of 270 models, rejects 55 and is off by one vertex for 2 (both close to the
+  threshold). The two Kennicott models placed once (`bd126b61`, `e9a5bbb1`) rest on a single
+  record; `e9a5bbb1`'s offset agrees with the seam test.
 
 ---
 

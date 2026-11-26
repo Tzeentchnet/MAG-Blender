@@ -1003,8 +1003,8 @@ def build_map(lib, level_index, opts, mcache, scene, progress=None):
     stats['placed'] = len(mesh_hashes) - len(skipped)
     stats['lit'] = light.placed if light else 0
     if light is not None:
-        print('MAG: %s baked lighting: %d placements lit, %d records with an unknown layout skipped'
-              % (name, light.placed, light.unmatched))
+        print('MAG: %s baked lighting: %d placements lit (%d with a fitted layout), %d records '
+              'with an unknown layout skipped' % (name, light.placed, light.fit, light.unmatched))
     stats['foliage'] = 0
     if opts.include_foliage:
         try:
@@ -1044,8 +1044,10 @@ class _MapLighting:
                 print('MAG: baked lighting placements %d != %d, ignored' % (len(per), len(lv['mesh'])))
             per = [0] * len(lv['mesh'])
         self.per = per
+        self.mesh = lv['mesh']
         self.layout = {}  # model hash -> ({mesh index: offset}, total, [V per mesh]) or None
-        self.placed = self.unmatched = 0
+        self.fitted = {}  # (model hash, record length) -> ({mesh index: offset}, [V per mesh]) or None
+        self.placed = self.unmatched = self.fit = 0
 
     def _layout(self, h):
         if h not in self.layout:
@@ -1054,6 +1056,31 @@ class _MapLighting:
             offs, n = lit.lit_offsets(m, lambda mh: self.mcache.flags(mh, zi))
             self.layout[h] = (offs, n, [me.V for me in m.meshes]) if offs else None
         return self.layout[h]
+
+    def _fit(self, h, n):
+        """Layout of records of model ``h`` whose length ``n`` does not match its lit meshes,
+        fitted from all of this level's records of that model and length (``lighting.fit_layout``)."""
+        key = (h, n)
+        if key not in self.fitted:
+            self.fitted[key] = None
+            _, zi, ri = self.hits[h]
+            offs = self._layout(h)[0]
+            m, geoms = self.lib.model(zi, ri)
+            meshes = [(mi, geoms[mi].positions) for mi in sorted(offs) if geoms[mi] is not None]
+            records = []
+            for mh, rh in zip(self.mesh.tolist(), self.per):
+                if rh and mh == h and len(records) < lit.FIT_RECORDS:
+                    d = lit.read_lighting(*self.lib.record(*self.recs[rh]))
+                    if len(d) == n:
+                        records.append(d)
+            if len(meshes) == len(offs) and records:
+                fit, costs = lit.fit_layout(meshes, records)
+                if fit is not None:
+                    vs = [len(g.positions) if g is not None else me.V for me, g in zip(m.meshes, geoms)]
+                    self.fitted[key] = (fit, vs)
+                print('MAG: baked lighting %08x (%d entries, %d records): fitted %s, cost %s'
+                      % (h, n, len(records), fit, {k: round(v, 2) for k, v in costs.items()}))
+        return self.fitted[key]
 
     def place(self, i, h, coll, M, target):
         rh = self.per[i]
@@ -1067,8 +1094,12 @@ class _MapLighting:
         z, r = self.lib.record(zi, ri)
         data = lit.read_lighting(z, r)
         if len(data) != n:
-            self.unmatched += 1
-            return False
+            fit = self._fit(h, len(data))
+            if fit is None:
+                self.unmatched += 1
+                return False
+            offs, vs = fit
+            self.fit += 1
         values = data.astype(np.float32) / 255.0
         made = False
         for src in coll.all_objects:

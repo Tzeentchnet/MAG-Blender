@@ -104,7 +104,7 @@ MAG (USA).dec.iso                    ISO9660 + Joliet
 | Water | Done: dark glossy base in EEVEE and Cycles, flat colour in Workbench *Texture* mode |
 | Maps: sky | Done: the scene World (default) or the dome mesh; orientation unconfirmed |
 | Maps: collision | Done (optional): terrain and every placed piece's collision mesh, as render-hidden wireframe objects |
-| Maps: baked lighting | Done for 94 % of lit placements: per-vertex sun and sky terms as a `mag_light` attribute that darkens the base colour; the game's exact lighting formula is unknown |
+| Maps: baked lighting | Done for every lit placement (6 % through a fitted layout): per-vertex sun and sky terms as a `mag_light` attribute that darkens the base colour; the game's exact lighting formula is unknown |
 
 See [roadmap.md](roadmap.md) for the plan on each gap.
 
@@ -124,7 +124,7 @@ See [roadmap.md](roadmap.md) for the plan on each gap.
 | `tools/sky_check.py` | Every level's sky dome: the planar UVs fill the texture disc, and the World's direction mapping lands within 12 texels of them |
 | `tools/sky_test.py` | Builds a map's sky as World and as Dome and renders the same four views of each with EEVEE; they must agree |
 | `tools/collision_check.py` | Every level's collision: all records decode, placements name them unambiguously, piece collision lies on its model and terrain collision on the leaf tiles |
-| `tools/lighting_check.py` | Every level's baked lighting: each record named by one placement, record length against the model's vertex-lit meshes, and value agreement at mesh seams |
+| `tools/lighting_check.py` | Every level's baked lighting: each record named by one placement, record length against the model's vertex-lit meshes (fitting the layout of the records that differ), and value agreement at mesh seams |
 | `tools/baseline.py` | Regression baselines: per-level counts and per-model decode digests against `tools/baselines/baseline.json` (`--write` to store) |
 | `tools/missing_pieces.py` | Explains placements whose `Mesh` hash resolves to no model (searches every record table on the disc) |
 

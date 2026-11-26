@@ -253,14 +253,35 @@ there are no lightmap textures.
     (whole trees sit in a building's shadow), and it does not follow N·L for any single
     direction. Sunlit values are mostly 0.27–0.76 (median 0.38); 59 % of entries are 0.
   * `sky` is a soft ambient or sky term: median 0.81 where the sun reaches, 0.36 in shadow.
-* **Unknown layout.** For a few models N is larger than the vertex-lit vertex count: 1,323
-  records (6 %), 16 model hashes, such as Baku's `5552a9be` (544 entries for 532 vertices, the last mesh
-  at the end) and Unalaska's `86c25738` (354 = 2 × 177, each lit mesh stored twice with the
-  vertices reordered). These models exist once on the disc, so the extra entries are not from
-  another version of the model. The importer skips their lighting.
+* **Count.** N counts the **decoded** vertices: for `94727d6f` (two Edge partitions) the mesh
+  header says 1,324 vertices, the partitions hold 1,327, and N is 1,327.
+* **Other layouts.** For 15 models N is larger than the vertex-lit vertex count: 1,322 records
+  (6 %). The lit meshes are still stored in mesh order, but with extra entries before, between or
+  after them. The layout is the same for a model on every map and for every model of one family:
+
+  | Models | Lit meshes (V) | N | Mesh offsets | Extra entries |
+  | --- | --- | --- | --- | --- |
+  | `5552a9be` (Baku), `70445cc6`, `ba2ddee4`, `b261cb23`, `b1881408` | 140, 340, 52 | 544 | 0, 152, 492 | 12 after the first mesh |
+  | `8134366c`, `86c25738` (Unalaska), `36b09204` | 96, 54, 27 | 354 | 0, 273, 327 | 177 after the first mesh: a second copy of all three meshes (the copy of mesh 2 at 192), vertices reordered |
+  | `ad331ef6`, `93cb46b7`, `21100978`, `99d35d7b`, `4233accd` | 51 | 405 | 0 | the same 51 values again at 67, 220, 271 and 322, other data between |
+  | `bd126b61` (Kennicott, 1 placement) | 8 | 264 | 42 | |
+  | `e9a5bbb1` (Kennicott, 1 placement) | 77 | 5,998 | 4,913 | |
+
+  These models exist once on the disc, so the extra entries are not from another version of the
+  model on the disc; they look like bakes of an earlier export (duplicated or extra vertices).
+  The offsets were found from the data (`lighting.fit_layout`): lighting is smooth over a mesh,
+  so at the right offset each vertex's value is close to that of its nearest vertices and equal
+  across seams. For each lit mesh and start offset the cost is the mean absolute difference to the
+  3 nearest vertices over up to 64 records of the model; the offsets are chosen in mesh order
+  without overlap to minimise the summed cost relative to each mesh's median cost, and a fit is
+  accepted when every mesh is at most 0.75 of its median (the fits above are 0.4–0.73). Fitted
+  records pass the seam test at the same rate as the others. As a control, inserting random gaps
+  into the records of models that do match gives the true offsets for 213 of 270 models, rejects
+  55 and is off by one vertex for 2.
 
 `tools/lighting_check.py` checks every level: unique references, the layout match (94 % of
-records overall; 100 % on Alaska, Raven and Valor maps), and that vertices of a lit mesh at the
+records overall; 100 % on Alaska, Raven and Valor maps) or fit (the rest; every record on the
+disc is covered), and that vertices of a lit mesh at the
 same position carry the same value far more often than random vertex pairs do (0.58–1.00 against
 0.02–0.15). Agreement is lower on boxy maps because hard edges are lit per normal.
 

@@ -144,7 +144,8 @@ tools/             validation and test scripts (see below)
   rebased halves) and RGBA8 colours; the batch origin is an 81-byte entry in the `.clv`.
   Baked lighting (`84DFB280`) is one record per lit placement, named at +166 after its
   `InstanceProperties` object: 4 bytes `(0, sky, 0, sun)` per vertex of the meshes whose material
-  has flag `0x10000000` (u32 at +0x28).
+  has flag `0x10000000` (u32 at +0x28). For 15 models the meshes sit at other offsets with extra
+  entries between them; the importer finds those offsets from the data.
 * Asset names come from the game's own property tables (`model_name`, `Model`,
   `ModelFileName`…) and animation names from the Maya source paths stored in the Havok files.
 
@@ -164,8 +165,9 @@ tools/             validation and test scripts (see below)
   been found. The layers' alpha masks and specular values are not used.
 * Baked lighting: the weights that turn the sky and sun terms into a brightness are a calibration
   (the median sunlit vertex comes out at 1.0), not the game's formula. About 6 % of lit placements
-  (16 models, such as Baku's most common tree) store their lighting in a layout that is not
-  understood; they are placed without it.
+  (16 models, such as Baku's most common tree) store extra entries between their meshes; the
+  importer fits each mesh's offset from the lighting itself (see the console), which is reliable
+  for models placed many times and a best guess for the two Kennicott models placed once.
 * The sky's orientation is unconfirmed: the dome has no UVs, and the importer maps its top-down
   texture with a planar projection that may be mirrored or turned compared with the game. Fix
   it in the World's *Sky Rotation* node if a sun or landmark disagrees. The sky's fog and tint
