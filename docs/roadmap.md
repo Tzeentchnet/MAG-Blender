@@ -8,7 +8,7 @@ All four are done. The format details they build on are in [formats/](formats/).
 | --- | --- | --- | --- | --- |
 | 1 | ~~Foliage and clutter are not placed~~ | — | **Done:** optional Geometry Nodes import, verified on Baku and Canal | Follow-ups: ~~distance fade~~ (done), tint meaning |
 | 2 | ~~Terrain uses only the macro colour map~~ | — | **Done:** four detail layers blended by the weight map (*MAG Terrain* node group), verified on 6 maps | Follow-ups: ~~distance fade to macro~~ (done), layer alpha masks |
-| 3 | ~~Water shows its normal map in Workbench *Texture* mode~~ | — | **Done:** 1×1 viewport-colour image | Follow-up: props misread as water |
+| 3 | ~~Water shows its normal map in Workbench *Texture* mode~~ | — | **Done:** 1×1 viewport-colour image | Follow-up: ~~props misread as water~~ (done: glass, by technique) |
 | 4 | ~~Placements that point to pieces that aren't on the disc~~ | — | **Done:** classified in the import report, optional empties | — |
 
 Fixed while working on this list: the importer missed **12 terrain tiles on Canal**. Leaf
@@ -170,9 +170,10 @@ node. Workbench *Texture* mode draws that, and EEVEE and Cycles output is unchan
 `tools/map_test.py` renders the widest flat water surface top-down in Workbench and checks its
 mean colour is dark and not the normal map. This passes on Baku and Canal.
 
-**Follow-up:** the "normal map but no colour = water" rule also matches a few small props (stacked
-cases on Canal render dark and glossy). Telling them apart needs the material header (pass or
-technique flags); see *Further work → Materials*.
+~~**Follow-up:** the "normal map but no colour = water" rule also matches a few small props.~~
+**Done:** the material header gives the technique, and the two no-colour techniques are water
+(`b18b8189`) and glass (`f436de9a`, the stacked display cases on Canal among them). See
+[Material header](#material-header--done).
 
 ---
 
@@ -350,20 +351,58 @@ placement on the disc gets its lighting (Baku's most common tree `5552a9be` incl
 
 ---
 
+## Material header — done
+
+The material record is now decoded structurally instead of scanned for texture hashes. The format
+is in [textures-and-materials.md](formats/textures-and-materials.md#material-records-7cbe7595).
+
+* The payload is a packed serialization of the runtime object the recomp's `material-*.md`
+  describe: a 0x80-byte header, the binding table (count at +0x1D), then `0xDEADBEEF`-tagged
+  engine parameters, constant parameters with their values, and pass records. The header offsets
+  at +0x44 are runtime offsets, not payload offsets (the terrain's "values at +0x322" was a
+  coincidence of the 0x418-byte layout).
+* Header: alpha test (+0x06 bit `0x80`) with its reference (+0x09), render group bits (+0x08:
+  wind, translucent, level, skinned, vertex-lit), the technique hash (+0x12, 62 on the disc) and
+  the vertex attributes the technique reads (+0x28, a superset of every mesh's vertex format).
+* Constants are named per technique (`materials.TECHNIQUES`): the UV transform of the base maps
+  and the detail-map scale for 31 techniques, the terrain rows, the water colour.
+* Builder (`MATERIAL_VERSION` 2): alpha test at the game's reference instead of "texture has
+  transparent texels"; Blended translucent materials; the UV transform; detail normal (UDN) and
+  detail colour (2× modulate); water and glass by technique.
+* The texture-alpha guess had been wrong for every material whose alpha is not opacity: the
+  Raven armour (`heavy_armor_black` and the other Raven classes) lost its sleeves and trousers.
+  It now renders whole (`char_test.py … eevee`).
+* Checks: `tools/material_check.py` (offline, every material: structure, bindings against the old
+  scan, header consistency, terrain constants against the fixed offsets, technique parameters;
+  `--models` the skinned bit and vertex formats against all 19,859 models) passes;
+  `tools/baseline.py` now stores a material summary and digest; `map_test.py … eevee materials`
+  checks the node wiring and renders glass, alpha-tested and detail shots (Canal, Baku).
+
+### Follow-ups
+
+* **Unnamed constants.** Most techniques have a `(r, g, b, power)` row that looks like specular
+  colour and exponent, plus tints and scalars. Naming them needs the technique's programs (not in
+  the material: a separate shader resource, `+0x38` at run time) or more correlation with the
+  textures.
+* **Glass and water shading.** Both are plain Principled approximations. The glass and water
+  constants (wave directions, fresnel-like rows, the water colour's alpha) and the environment
+  cube (slot 18, not on the disc) are not used.
+* **Pass records** and the remaining header bytes (+0x04, +0x07, +0x0C, +0x16) are not decoded.
+* **Detail colour order.** `53126094` has two detail scales for slots 16 and 17; which is which is
+  a guess (slot order).
+
+---
+
 ## Further work
 
 These are smaller or lower-priority items found while documenting the formats.
 
 ### Materials
 
-* Wire the detail normal (16) and detail colour (17) slots. This needs the detail UV scale. Terrain
-  materials keep theirs in the values block at `u16 +0x46` (+2); props may do the same. The recomp's
-  `material-values.md` is the place to start.
-* Decode the material header properly instead of scanning for texture hashes. This would give
-  pass and technique flags, alpha-test thresholds and UV transforms. One field is known: the u32
-  flag word at +0x28, whose bit `0x10000000` marks vertex-lit materials (baked lighting). In the terrain materials (§2)
-  the recomp's `u16 +0x46` (values offset) holds on disc too: 0x320, with the values at +0x322.
-  The other header fields have not been checked.
+* ~~Wire the detail normal (16) and detail colour (17) slots.~~ **Done** with the detail scale
+  from the material constants (see [Material header](#material-header--done)).
+* ~~Decode the material header properly instead of scanning for texture hashes.~~ **Done** (see
+  [Material header](#material-header--done)); its follow-ups are listed there.
 * Emissive (15) and environment (18) slots.
 
 ### Maps

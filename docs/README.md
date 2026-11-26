@@ -17,7 +17,7 @@ code wins and the document needs fixing.
 | [formats/disc-and-archives.md](formats/disc-and-archives.md) | The ISO9660/Joliet image, disc layout, PSARC 1.3 archives and partial block extraction |
 | [formats/zrb.md](formats/zrb.md) | The ZRB resource-block container: header, segments, dependencies, records, type hashes |
 | [formats/models.md](formats/models.md) | Model records, mesh entries, node tables, RSX vertex buffers, Edge partitions, vertex codecs, skinning palettes |
-| [formats/textures-and-materials.md](formats/textures-and-materials.md) | GCM texture records, swizzling, DDS conversion, material texture bindings and sampler slots |
+| [formats/textures-and-materials.md](formats/textures-and-materials.md) | GCM texture records, swizzling, DDS conversion; material records (header, texture bindings, shader parameters, techniques) and sampler slots |
 | [formats/havok.md](formats/havok.md) | Havok 6.5 packfiles, skeletons, animation bindings, spline-compressed animation |
 | [formats/properties-and-levels.md](formats/properties-and-levels.md) | Reflected property objects (`.zpr`, `.clv`), map placements, terrain tiles, foliage batches, asset naming |
 | [roadmap.md](roadmap.md) | Known gaps in the importer and the planned work on them |
@@ -49,7 +49,7 @@ MAG (USA).dec.iso                    ISO9660 + Joliet
 | Asset | Record type | Main data | Notes |
 | --- | --- | --- | --- |
 | Texture | `85CE0660` | Segment 3 | GCM ARGB8 / DXT1 / DXT3 / DXT5, linear or Morton-swizzled |
-| Material | `7CBE7595` | Payload | A table of (texture hash, pass mask, sampler slot) bindings |
+| Material | `7CBE7595` | Payload | Header (alpha test, render groups, technique), texture bindings, shader constants |
 | Static model | `A4F4D23C` | Segment 3 | Hierarchical: node table, RSX vertex and index buffers |
 | Skinned model | `10B17150` | Segments 3 and 4 | Edge partitions with a per-partition skinning palette |
 | Level piece | `80DC0132` | Segments 3 and 4 | Edge static partitions; terrain tiles are level pieces too |
@@ -97,11 +97,11 @@ MAG (USA).dec.iso                    ISO9660 + Joliet
 | Skinned characters and gear | Done: Edge decode, skin weights, automatic skeleton fitting |
 | Animations | Done: spline and interleaved, matching game space within 0.1 mm |
 | Textures | Done: DXT passed through unchanged as DDS, ARGB un-swizzled |
-| Materials | Partial: base, normal (DXT5nm or RGB) and specular are wired; other slots are left unconnected |
+| Materials | Done for the known parts: base, normal (DXT5nm or RGB), specular, detail normal and colour, alpha test with the game's reference, translucency, UV transform, water and glass by technique. Emissive, mask and environment slots and most shader constants are unused |
 | Maps: placed pieces | Done. Unresolved placements are reported as particle emitters (all maps) or missing pieces (one cut piece on Kennicott), optionally placed as empties |
 | Maps: terrain | Done: any level of the terrain tree (finest by default, *Terrain LOD* option) with the four detail layers blended by the weight map, fading to the macro colour with camera distance |
 | Maps: foliage | Done (optional): Geometry Nodes instances with rotation, scale and tint; optional camera-distance fade as in the game |
-| Water | Done: dark glossy base in EEVEE and Cycles, flat colour in Workbench *Texture* mode |
+| Water | Done: glossy base in the material's water colour in EEVEE and Cycles, flat colour in Workbench *Texture* mode; recognised by technique |
 | Maps: sky | Done: the scene World (default) or the dome mesh; orientation unconfirmed |
 | Maps: collision | Done (optional): terrain and every placed piece's collision mesh, as render-hidden wireframe objects |
 | Maps: baked lighting | Done for every lit placement (6 % through a fitted layout): per-vertex sun and sky terms as a `mag_light` attribute that darkens the base colour; the game's exact lighting formula is unknown |
@@ -115,9 +115,9 @@ See [roadmap.md](roadmap.md) for the plan on each gap.
 | `tools/scan_cli.py` | Scans the ISO outside Blender and prints the catalog |
 | `tools/validate_models.py` | Decodes every model and reports statistics and failures |
 | `tools/blender_e2e.py` | Imports one item of every category inside Blender |
-| `tools/map_test.py` | Imports a map and renders overview shots; `foliage` also checks every foliage model's evaluated instance transforms and adds ground-level shots, `eevee` renders with EEVEE, `terrain` renders a four-tile corner with the terrain alone and counts layered materials, `macro` imports *Macro Only* terrain, `lodN` imports terrain LOD N, checks its tile count against the tree and adds a terrain-only overview, `fade` turns on the foliage Distance Fade and checks every evaluated instance scale against the game's formula (and adds a far terrain shot with `terrain`), `nomacrofade` turns the terrain macro fade off, `sky` adds a shot of the sky from above the map (`skydome` imports the sky as the Dome, `nosky` not at all), `collision` imports the collision, checks each placed collision object against its map instance and the terrain collision against the tiles, and renders it, `light` checks the baked lighting attribute on every lit object and adds a close shot of lit trees (`nolight` imports without it) |
+| `tools/map_test.py` | Imports a map and renders overview shots; `foliage` also checks every foliage model's evaluated instance transforms and adds ground-level shots, `eevee` renders with EEVEE, `terrain` renders a four-tile corner with the terrain alone and counts layered materials, `macro` imports *Macro Only* terrain, `lodN` imports terrain LOD N, checks its tile count against the tree and adds a terrain-only overview, `fade` turns on the foliage Distance Fade and checks every evaluated instance scale against the game's formula (and adds a far terrain shot with `terrain`), `nomacrofade` turns the terrain macro fade off, `sky` adds a shot of the sky from above the map (`skydome` imports the sky as the Dome, `nosky` not at all), `collision` imports the collision, checks each placed collision object against its map instance and the terrain collision against the tiles, and renders it, `light` checks the baked lighting attribute on every lit object and adds a close shot of lit trees (`nolight` imports without it), `materials` counts the material kinds and checks their node wiring and adds close shots of glass, alpha-tested and detail-mapped pieces |
 | `tools/anim_check.py` | Compares Blender's evaluated pose with the skeleton composed in game space (passes at under 0.1 mm) |
-| `tools/char_test.py`, `tools/render_previews.py` | Character and asset preview renders |
+| `tools/char_test.py`, `tools/render_previews.py` | Character and asset preview renders (`char_test.py … eevee` renders materials with EEVEE) |
 | `tools/dump_record.py` | Lists or hex-dumps any ZRB record (every type) with its segment data, straight from the disc |
 | `tools/foliage_check.py` | Decodes every foliage batch of a level and checks it against the `.clv` transform table |
 | `tools/terrain_check.py` | Terrain detail layers: weight-map continuity across tile borders for the decoded channel order (against the other orders and flipped UVs), and world-continuous detail UVs |
@@ -125,10 +125,11 @@ See [roadmap.md](roadmap.md) for the plan on each gap.
 | `tools/sky_test.py` | Builds a map's sky as World and as Dome and renders the same four views of each with EEVEE; they must agree |
 | `tools/collision_check.py` | Every level's collision: all records decode, placements name them unambiguously, piece collision lies on its model and terrain collision on the leaf tiles |
 | `tools/lighting_check.py` | Every level's baked lighting: each record named by one placement, record length against the model's vertex-lit meshes (fitting the layout of the records that differ), and value agreement at mesh seams |
-| `tools/baseline.py` | Regression baselines: per-level counts and per-model decode digests against `tools/baselines/baseline.json` (`--write` to store) |
+| `tools/material_check.py` | Every material: the record structure parses, bindings agree with the old hash scan, header fields agree with each other (alpha bit and reference, group bit and baked-lighting flag), terrain constants agree with the fixed-offset reading, and every technique in `materials.TECHNIQUES` has its parameters; `--models` checks the skinned group bit and vertex formats against every model, `--techniques` lists the 62 techniques |
+| `tools/baseline.py` | Regression baselines: per-level counts, a material summary and digest, and per-model decode digests against `tools/baselines/baseline.json` (`--write` to store) |
 | `tools/missing_pieces.py` | Explains placements whose `Mesh` hash resolves to no model (searches every record table on the disc) |
 
-`baseline.py`, `collision_check.py`, `dump_record.py`, `foliage_check.py`, `lighting_check.py`, `missing_pieces.py`, `placement_check.py`, `sky_check.py` and `terrain_check.py` run outside Blender on the add-on's cached index
+`baseline.py`, `collision_check.py`, `dump_record.py`, `foliage_check.py`, `lighting_check.py`, `material_check.py`, `missing_pieces.py`, `placement_check.py`, `sky_check.py` and `terrain_check.py` run outside Blender on the add-on's cached index
 (`tools/_offline.py`).
 
 Use Workbench renders for geometry checks and EEVEE for materials. Workbench shows only an image
@@ -138,8 +139,10 @@ node, not the shaded result.
 
 * The recomp project's render-frontend specs,
   `MAG-Windows-Recomp/mag-recomp/docs/render-frontend/behavior/`. `geometry-streams.md` and
-  `geometry-normals.md` define the Edge descriptor codecs. `material-*.md` and
-  `texture-unit-controls.md` are the best starting point for the unmapped material slots.
+  `geometry-normals.md` define the Edge descriptor codecs. `material-sources.md` and
+  `material-values.md` describe the runtime material object the loader expands a material
+  record into (header fields, parameter records, value types, technique table); the record on
+  disc is a packed serialization of it, so their offsets do not index the payload.
 * Havok 6.5 SDK class layouts (4-byte pointers), for `hkaSkeleton`, `hkaAnimationBinding` and
   `hkaSplineCompressedAnimation`.
 * Sony Edge Geometry documentation, for the partition and stream concepts.

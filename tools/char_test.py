@@ -1,6 +1,8 @@
 """Import a character, render rest pose and an animated frame.
 
-blender --background --factory-startup --python tools/char_test.py -- ISO OUTDIR char_label anim_label frame
+blender --background --factory-startup --python tools/char_test.py -- ISO OUTDIR char_label anim_label frame [eevee]
+
+``eevee`` renders with EEVEE (materials, alpha) and a sun instead of Workbench's texture colours.
 """
 import math
 import os
@@ -11,6 +13,7 @@ from mathutils import Vector
 
 argv = sys.argv[sys.argv.index('--') + 1:]
 ISO, OUT, CHAR, ANIM, FRAME = argv[0], argv[1], argv[2], argv[3], int(argv[4])
+EEVEE = 'eevee' in argv[5:]
 os.makedirs(OUT, exist_ok=True)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import mag_importer  # noqa: E402
@@ -35,8 +38,19 @@ def imp(cat, label):
 imp('CHARACTER', CHAR)
 rig = next(o for o in scene.objects if o.type == 'ARMATURE')
 bpy.context.view_layer.objects.active = rig
-scene.render.engine = 'BLENDER_WORKBENCH'
-scene.display.shading.color_type = 'TEXTURE'
+if EEVEE:
+    scene.render.engine = 'BLENDER_EEVEE'
+    sun = bpy.data.objects.new('sun', bpy.data.lights.new('sun', 'SUN'))
+    sun.data.energy = 3.0
+    sun.rotation_euler = (math.radians(50), 0.0, math.radians(30))
+    scene.collection.objects.link(sun)
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new('World')
+    bg = scene.world.node_tree.nodes.get('Background')
+    bg.inputs['Color'].default_value = (0.35, 0.37, 0.4, 1.0)
+else:
+    scene.render.engine = 'BLENDER_WORKBENCH'
+    scene.display.shading.color_type = 'TEXTURE'
 scene.render.resolution_x = scene.render.resolution_y = 512
 cam = bpy.data.objects.new('cam', bpy.data.cameras.new('cam'))
 scene.collection.objects.link(cam)

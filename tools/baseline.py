@@ -17,6 +17,10 @@ Per level (offline, no Blender):
 * baked lighting records, placements that name one, and records whose length fits the placed
   model's vertex-lit meshes.
 
+Materials (whole disc, skipped when levels are named): counts of the decoded header features
+(alpha-tested, translucent, water, glass, terrain, UV transforms, detail scales), materials per
+technique, and a digest of every material's decode (header fields, bindings, constants).
+
 Per ZRB: a digest of every decoded model in it (positions, normals, UVs, colours, indices,
 joints, weights, rounded to 1e-4), plus counts of models, meshes and decode failures. A digest
 change names the ZRB and the first model whose geometry changed.
@@ -33,8 +37,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _offline  # noqa: E402
-from mag_importer.core import catalog, foliage, level as lvl, lighting, models, sky  # noqa: E402
-from mag_importer.core.zrb import MODEL_TYPES, T_FOLIAGE_BATCH, T_LIGHTING  # noqa: E402
+from mag_importer.core import catalog, foliage, level as lvl, lighting, materials, models, sky  # noqa: E402
+from mag_importer.core.zrb import MODEL_TYPES, T_FOLIAGE_BATCH, T_LIGHTING, T_MATERIAL  # noqa: E402
 
 DEFAULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'baselines', 'baseline.json')
 
@@ -157,6 +161,32 @@ def zrb_models(lib, zi):
                 per_model=per)
 
 
+def material_stats(lib):
+    tex = lib.texture_hashes()
+    seen, per = set(), {}
+    for zi, z in enumerate(lib.index.zrbs):
+        for ri, r in enumerate(z.records):
+            if r[7] == T_MATERIAL and r[8] not in seen:
+                seen.add(r[8])
+                zz, rr = lib.record(zi, ri)
+                per[r[8]] = materials.parse_material(zz.payload(rr), r[8], tex)
+    techs = {}
+    h = hashlib.sha1()
+    for name in sorted(per):
+        m = per[name]
+        techs['%08x' % m.technique] = techs.get('%08x' % m.technique, 0) + 1
+        h.update(json.dumps([name, m.parsed, m.technique, m.render, m.group, m.alpha_ref, m.flags,
+                             sorted(m.bindings.items()),
+                             [(c.mask, c.dest, c.type, [round(v, 4) for v in c.values]) for c in m.constants]]).encode())
+    ms = list(per.values())
+    return dict(count=len(ms), parsed=sum(m.parsed for m in ms), alpha_tested=sum(m.alpha_test for m in ms),
+                translucent=sum(m.translucent for m in ms), water=sum(m.water for m in ms),
+                glass=sum(m.glass for m in ms), terrain=sum(m.terrain is not None for m in ms),
+                uv_transforms=sum(bool(m.uv_transform()) for m in ms),
+                detail_scales=sum(bool(m.detail_scale(s)) for m in ms for s in (16, 17)),
+                techniques=techs, digest=h.hexdigest()[:16])
+
+
 # -- compare --------------------------------------------------------------------------------------
 def diff(old, new, path=''):
     """Lines describing every difference between two JSON-like values."""
@@ -188,13 +218,16 @@ def main():
     a = ap.parse_args()
     lib = _offline.open_library()
     want = [w.lower() for w in a.levels]
-    cur = dict(index_version=catalog.INDEX_VERSION, levels={}, zrbs={})
+    cur = dict(index_version=catalog.INDEX_VERSION, levels={}, zrbs={}, materials={})
     t0 = time.time()
     levels = [lv for lv in lib.index.levels if not want or any(w in lv['name'] for w in want)]
     for lv in levels:
         cur['levels'][lv['name']] = level_stats(lib, lv)
         print('level %-30s %s' % (lv['name'], {k: v for k, v in cur['levels'][lv['name']].items()
                                                if k not in ('foliage', 'terrain_lods')}))
+    if not want:
+        cur['materials'] = material_stats(lib)
+        print('materials %s' % {k: v for k, v in cur['materials'].items() if k != 'techniques'})
     t1 = time.time()
     if not a.no_models:
         arch = {lv['archive'] for lv in levels} if want else None
@@ -223,6 +256,8 @@ def main():
         stored['index_version'] = cur['index_version']
         stored.setdefault('levels', {}).update(cur['levels'])
         stored.setdefault('zrbs', {}).update(cur['zrbs'])
+        if cur['materials']:
+            stored['materials'] = cur['materials']
         os.makedirs(os.path.dirname(a.file), exist_ok=True)
         with open(a.file, 'w') as fh:
             json.dump(stored, fh, indent=1, sort_keys=True)
@@ -239,8 +274,9 @@ def main():
     old_l = stored.get('levels', {})
     if want:
         old_l = {k: v for k, v in old_l.items() if k in cur['levels']}
-    old = dict(levels=old_l, zrbs=old_z)
-    lines = diff(old, dict(levels=cur['levels'], zrbs=cur['zrbs']))
+    old_m = stored.get('materials', {}) if cur['materials'] else {}
+    old = dict(levels=old_l, zrbs=old_z, materials=old_m)
+    lines = diff(old, dict(levels=cur['levels'], zrbs=cur['zrbs'], materials=cur['materials']))
     if stored.get('index_version') != cur['index_version']:
         print('note: baseline index version %s, current %s' % (stored.get('index_version'), cur['index_version']))
     for l in lines[:200]:

@@ -67,28 +67,179 @@ Both checks sample a 64×64 grid of level 0, decoded by the numpy DXT decoder in
 
 ## Material records (`7CBE7595`)
 
-The serialized header's size depends on the shader technique, and its layout has not been
-decoded. Texture bindings are instead found by **scanning** the payload for any u32 that is a
-known texture name hash, then checking the 14-byte binding entry that starts there:
+Code: `materials.parse_material`. Check: `tools/material_check.py`.
+
+The payload is a byte-packed serialization of the runtime material object. Pointers are written
+as `0xDEADBEEF`, and each variable-size section is a run of records that start with that marker
+and a tag. Every one of the 3,878 materials on the disc has this layout:
+
+```
++0x00   0x80-byte header
++0x80   texture bindings, 14 bytes each (count = u8 +0x1D)
+        engine parameters, 20 bytes each (tag 2)
+        constant parameters, 23 bytes each (tag 4), then their values
+        pass records, 28 bytes each (tag 7); the last one is followed by a trailer
+```
+
+The record is not the runtime layout. Its header offsets (`u16 +0x44 … +0x4C`) point into the
+expanded object the loader builds (a 0x60-byte header, 32-byte binding records, 16-byte
+parameter records), which matches the recomp's `material-sources.md` and `material-values.md`.
+None of them can be used to index the payload.
+
+### Header
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| +0x00 | u32 | 0 |
+| +0x04 | u8 | 1, 2 or 3 (unknown; not the pass record count) |
+| +0x06 | u8 | **render bits**: `0x80` = alpha test. `0x40`, `0x04` and `0x02` also occur (unknown) |
+| +0x07 | u8 | unknown (`0x02` on most; `0x82` on terrain) |
+| +0x08 | u8 | **render group bits** (below) |
+| +0x09 | u8 | **alpha-test reference** (0–255). Nonzero exactly when render bit `0x80` is set (317 materials; 32 is typical, up to 200) |
+| +0x0C | u16 | unknown (0x00D0–0x0810) |
+| +0x12 | u32 | **technique hash**: the shader. 62 distinct on the disc |
+| +0x16, +0x18 | u16 | unknown, always equal |
+| +0x1D | u8 | **binding count** |
+| +0x1E | 6 bytes | a copy of +0x04…+0x09 |
+| +0x24 | u32 | 3 |
+| +0x28 | u32 | **vertex attributes** the technique reads (`MaterialInfo.flags`), plus `0x10000000` = baked vertex lighting |
+| +0x44 | u16 × 5 | runtime offsets (parameter records, values, technique map, technique table, descriptors) |
+| +0x4E | u16 | 3 |
+| +0x50 | 48 bytes | `0xFF` (14 materials have other bytes here) |
+
+**Render group bits** (+0x08). Checked on every material against the models that use it
+(`material_check.py --models`):
+
+| Bit | Meaning | Evidence |
+| --- | --- | --- |
+| `0x01` | Wind / foliage | All foliage-model materials, plus 88 materials of plants placed as level pieces |
+| `0x04` | Translucent | Scope lenses, vehicle windows, glass, blended level decals (85 materials) |
+| `0x10` | Static level geometry | Only on materials of level pieces (2,711 of 3,107) |
+| `0x20` | Skinned | Set exactly on the 56 materials of skinned meshes |
+| `0x40` | Baked vertex lighting | Set exactly when flag `0x10000000` is |
+| none | Dynamic models | Weapons, vehicles, props |
+
+They probably select the renderer's draw groups (in the recomp's `main-group-transitions.md`,
+group 0 has its own deformation and groups 8 and 9 are blended).
+
+**Vertex attributes** (+0x28, low 16 bits). Every mesh's vertex format ([models.md](models.md))
+is a subset of its material's attributes, and 93 % of meshes match exactly. Level pieces drop
+bit `0x001` (`0x20b` → `0x20a`); vertex-lit level pieces drop `0x082` or `0x08b` too.
+Foliage-model materials have 0.
+
+### Texture bindings
 
 ```
 +0   u32  texture name hash
-+4   u32  pass / technique mask    (must be 0 < mask < 0x10000)
++4   u32  pass mask (1, 2, 4, 8)
 +8   u8   sampler slot
-+9   u8   count                    (must be 1–4)
-+10  u32  offset (meaning unknown)
++9   u8   count (1-4; 3 for the environment slot 18)
++10  u32  runtime offset of the texture descriptor (0x18 apart)
 ```
 
-If a slot is bound more than once, the binding with the lowest pass mask wins. The scan is
-reliable because texture hashes almost never occur by chance and are checked against the global
-index.
+If a slot is bound more than once, the binding with the lowest pass mask wins (terrain materials
+are the exception: see below). The table also holds textures that are not on the disc: slot 18's
+environment cube `123456a6` (546 bindings) and a few slot 3 and 255 entries, presumably made at
+run time.
 
-**Flag word.** The u32 at +0x28 (`MaterialInfo.flags`). Its low bits look like the vertex
-attributes the technique reads (`0x20a`, `0x28a`, `0x60a`, `0x20b` seen). Bit **`0x10000000`**
-marks materials drawn with the placement's baked per-vertex lighting (see
-[properties-and-levels.md](properties-and-levels.md#baked-lighting-84dfb280)): a lighting
-record's length equals the vertex count of exactly these meshes. The rest of the header is still
-not decoded.
+Earlier versions of the importer found bindings by scanning the payload for known texture
+hashes. The parser keeps that scan as a fallback (`MaterialInfo.parsed` is then False). On the
+disc the scan finds exactly the table's entries for textures that exist.
+
+### Parameters
+
+A **parameter** sets shader constants. It has no name: it is identified by its technique and its
+*destination*, a byte offset inside the technique's program chunk (the chunk is not in the
+material, so the vertex or fragment register is unknown). The same parameter has a different
+destination in each pass.
+
+**Engine parameters** (tag 2) are values the renderer supplies:
+
+```
+DEADBEEF, u32 2, u32 semantic id, u32 pass mask, u32 destination
+```
+
+Semantic ids 1, 3, 4, 5, 7, 8 and 9 occur in nearly every technique (transforms and similar);
+2, 14–18, 22, 27, 29 and 30 in some. 31 and 32 occur only in the water technique; they may be the
+two water-constant rows the recomp's `scene-plan.md` writes for group 12.
+
+**Constant parameters** (tag 4) carry the material's own values:
+
+```
+DEADBEEF, u32 4, u32 pass mask, u16 value index, 3 bytes 0, u8 value type, u16 destination, 3 bytes
+```
+
+After the last constant come the values: `f32` words, indexed by the value index. Types follow
+the recomp's `material-values.md`: 2 = integer (one word), 4–7 = `f32` × 1–4 (8–10, matrices, do
+not occur). Pass mask 0 marks a handful of constants that no pass reads.
+
+**Known constants.** Meanings come from the values across a technique's materials
+(`materials.TECHNIQUES`):
+
+| Parameter | Value | Techniques | Evidence |
+| --- | --- | --- | --- |
+| UV transform | `(su, sv, ou, ov)`: `uv' = uv · s + o` | 31 | `(1, 1, 0, 0)` on 95 % of materials; the others fit their textures (`(32, 32, 0, 0)` with 64×64 base textures, `(0.2, 0.2, 0, 0)` with a 512×512 one) |
+| Detail scale | `(d, d)`: detail UV = `uv0 · d` | 25 | Present when slot 16 or 17 is bound (except 5 materials that bind slot 16 with no parameter for it); 1–256, mostly 8–32 |
+| Terrain layer UVs | `(s, s, s·x0, s·z0)` × 4 | terrain | Destinations 0x208–0x250; see [Terrain materials](#terrain-materials) |
+| Terrain layer specular | `(r, g, b, power)` × 4 | terrain | Destinations 0x448–0x490 |
+| Water colour | `(r, g, b, a)`, dark, e.g. `(0.007, 0.009, 0.015, 0.7)` | water | Destination 0x430; `a` is 0.05–0.9, unknown |
+
+Many techniques also have a `(r, g, b, power)` row that looks like a specular colour and exponent
+(for example `(0.047, 0.047, 0.047, 50)` at 0x2F8 in `7bda1e1f`), colour multipliers, and
+scalars. They are not used.
+
+When a technique has two detail parameters (`53126094` binds slots 16 and 17), the importer gives
+them to the bound detail slots in slot order. That order is a guess.
+
+### Pass records (tag 7)
+
+20 bytes each. Byte 1 counts up (0, 1, 2, …) and probably selects the technique table entry. The
+last 8 bytes vary with the technique (`00 00 03 b2 cc 00 fc 00` on terrain) and may be the
+recomp's 64-bit technique flags. The trailer after the last record holds 32-bit pairs that look
+like the technique table's (chunk offset, length) entries. Not decoded further.
+
+### Techniques
+
+The largest groups and the special ones:
+
+| Technique | Materials | Group bits | Slots | Use |
+| --- | --- | --- | --- | --- |
+| `f9f3bda5` | 1,440 | `0x10` | 0, 2, 3, 8, 12 | Terrain tiles |
+| `7bda1e1f` | 765 | `0x10` | 0, 2, 3, 4, 16 | Level pieces (151 alpha-tested) |
+| `9b4bb646` | 195 | `0x10` | 0, 2, 3, 4, 16 | Level pieces |
+| `154af603` | 183 | `0x00`, `0x01` | 3, 4, 16 | Props |
+| `53126094` | 141 | `0x00` | 3, 4, 5, 16, 17, 18 | Weapons and gear (detail colour) |
+| `1d64212b` | 86 | `0x20` | 3, 4, 5, 15, 255 | Characters |
+| `26e8d269` | 41 | `0x41`, `0x40` | 3 | Vertex-lit plants (all alpha-tested) |
+| `c1f9aedc` | 39 | `0x20` | 3, 4, 5, 15 | Characters (the colour's alpha is not opacity) |
+| `f436de9a` | 25 | `0x04` | 4, 18, 255 | **Glass**: windows, display cases |
+| `ff0cafee` | 19 | `0x01` | 3 | Foliage models |
+| `b18b8189` | 17 | `0x00` | 4, 18, 255 | **Water**: flat planes of 10 m to 1 km |
+| `b9f18d99` | 5 | `0x00` | 3, 255 | Sky domes |
+
+`tools/material_check.py --techniques` prints all 62.
+
+### What the importer builds
+
+* **Alpha.** An alpha-tested material clips the base colour's alpha at the header's reference
+  (`alpha ≥ ref`: a *Greater Than* node at `(ref − 0.5)/255`, render method Dithered). A
+  translucent material (group bit `0x04`) whose colour texture has alpha is Blended. Otherwise
+  the alpha channel is not opacity and stays unconnected. Before this decode, any colour texture
+  with some transparent texels became a cut-out, which put holes in the Raven armour
+  (`c1f9aedc`) and in other materials that store something else in alpha.
+* **UV transform.** When it is not the identity, a *Material UV transform* Mapping node feeds the
+  base colour, normal and specular maps (scale `(su, sv)`, location `(ou, 1 − sv − ov)` for
+  Blender's flipped V). This affects 39 materials on the disc.
+* **Detail normal (16).** Sampled at `uv0 · d` and added to the base normal's X and Y (UDN
+  blending) before the Normal Map node.
+* **Detail colour (17).** Sampled at `uv0 · d`. The base colour is multiplied by
+  `(2 · detail)^2.2`: 2× around mid-grey (the detail textures average 0.5), with the exponent
+  because the game presumably blends gamma-space values.
+* **Glass** (`f436de9a`): a clear, glossy, Blended surface (alpha 0.2), flag `mag_glass`.
+* **Water** (`b18b8189`): the water colour parameter as base colour, roughness 0.05, flag
+  `mag_water`.
+* Every material records its technique as `mag_technique`. `build.MATERIAL_VERSION` is stored as
+  `mag_v`, so the materials an older importer left in a `.blend` are rebuilt, not reused.
 
 ### Sampler slots
 
@@ -97,13 +248,13 @@ game, and from how the results render:
 
 | Slot | Meaning | Typical format | Importer |
 | --- | --- | --- | --- |
-| 3 | Base colour | DXT1, or DXT5 with alpha | Base Color; Alpha when it is a cut-out (dithered) |
+| 3 | Base colour | DXT1, or DXT5 with alpha | Base Color; Alpha only for alpha-tested or translucent materials (see above) |
 | 4 | Normal map | DXT5nm (X = A, Y = G), sometimes RGB | Normal Map node; Z rebuilt as √(1−x²−y²) |
 | 5 | Specular colour, gloss in alpha | DXT5 | Luminance → Specular IOR Level; 1 − A → Roughness |
 | 15 | Emissive or mask | — | Unconnected image node |
-| 16 | Detail normal | DXT5nm | Unconnected |
-| 17 | Detail colour | — | Unconnected |
-| 18 | Environment (3 entries) | — | Not added |
+| 16 | Detail normal | DXT5nm, often a flat 16×16 | Added to the normal map's XY at the detail scale |
+| 17 | Detail colour | DXT1, mid-grey centred | Multiplies the base colour at the detail scale |
+| 18 | Environment (3 entries) | Mostly a cube that is not on the disc | Not added |
 | 255 | Auxiliary mask | — | Unconnected |
 | 0, 2, 13 | Unknown | — | Not added |
 
@@ -142,13 +293,17 @@ layers line up with the dirt, pebble, rock and flat normals.
   maps the edge mismatch is 0.007–0.014 for this order, 0.009–0.056 for the other orders (when
   they differ at all), and 0.17–0.27 with V and U flipped.
 
-**Values block.** The material's `u16 +0x46` is 0x320. The values are 2-byte aligned at **+0x322**:
+**Constants.** Technique `f9f3bda5` has eight pass-1 constants (see [Parameters](#parameters)):
 
 ```
-+0x322  4 rows  (s, s, s·x0, s·z0)   layer k detail UV: uv_k = s · uv0 + (s·x0, s·z0)
-+0x362  4 rows  (r, g, b, p)         layer k specular colour and power, e.g. (0.005, 0.005, 0.005, 3),
-                                     (0.05, 0.05, 0.05, 5), (0, 0, 0, 1)
+0x208, 0x220, 0x238, 0x250   (s, s, s·x0, s·z0)   layer k detail UV: uv_k = s · uv0 + (s·x0, s·z0)
+0x448, 0x460, 0x478, 0x490   (r, g, b, p)         layer k specular colour and power, e.g.
+                                                  (0.005, 0.005, 0.005, 3), (0.05, 0.05, 0.05, 5), (0, 0, 0, 1)
 ```
+
+In the 0x418-byte terrain payload their values sit at +0x322 and +0x362, which is what the
+importer read before the record layout was decoded (and still reads if the structure does not
+parse). The material's `u16 +0x46` (0x320) is a runtime offset, and only coincidentally close.
 
 The scale `s` is per layer (10.5–36; Baku uses 12, 16, 17 and 21). `(x0, z0)` is the tile's origin in
 tiles, so the offset cancels UV 0's own per-tile offset: `uv_k = s · world_xz / L` with
@@ -182,12 +337,15 @@ per-region textures (hash C: DXT5 256×256 with data only in G and A, see
 
 ### Materials with no colour texture
 
-Materials that bind a normal map (slot 4) but no base colour are water or liquid shaders. They
-get a dark, glossy Principled base (0.015, 0.035, 0.04, roughness 0.05) and the custom property
-`mag_water`. The rule also catches a few small props (for example stacked cases on Canal).
+Two techniques bind a normal map (slot 4) but no base colour: water (`b18b8189`) and glass
+(`f436de9a`). Before the header was decoded, the importer treated all of them as water, so the
+glass of Canal's stacked display cases rendered dark and glossy. Both are now told apart by
+technique (see [What the importer builds](#what-the-importer-builds)); if a material's structure
+does not parse, the old rule still applies.
 Workbench's *Texture* colour mode draws the active image node whatever it is connected to, so
 every material without a colour texture gets an unconnected 1×1 `MAG_preview_<rgb>` image of its
-base colour as the active node (flag `mag_preview`). Rendered output does not change.
+base colour (or the water and glass viewport colour) as the active node (flag `mag_preview`).
+Rendered output does not change.
 
 ## Sky (`sky.zrb`)
 
