@@ -137,8 +137,15 @@ Foliage-model materials have 0.
 +10  u32  runtime offset of the texture descriptor (0x18 apart)
 ```
 
-If a slot is bound more than once, the binding with the lowest pass mask wins (terrain materials
-are the exception: see below). The table also holds textures that are not on the disc: slot 18's
+If a slot is bound more than once, the binding with the lowest pass mask wins, and within a pass
+the one with the lowest runtime offset (terrain materials are the exception: see below). A slot
+bound twice in one pass is a layer list ordered by offset, as on terrain: the lowest offset is the
+base layer. 12 techniques do this (about 290 materials): the road meshes on terrain tiles
+(`46ac25f9`, `b22aaa42`, 44 materials) list their road texture and normal map first and then the
+16×16 white placeholder `336759d8` (alpha 0) and the flat normal `75cb8229` as an unused second
+layer; others add a white tint (`fb20fae7`), a 64×4 ramp, a second blend layer, or a second slot
+15. Until `MATERIAL_VERSION` 4 the importer took the highest offset, so Baku's roads came out as the
+blank placeholder. The table also holds textures that are not on the disc: slot 18's
 environment cube `123456a6` (546 bindings) and a few slot 3 and 255 entries, presumably made at
 run time.
 
@@ -183,6 +190,7 @@ not occur). Pass mask 0 marks a handful of constants that no pass reads.
 | Terrain layer UVs | `(s, s, s·x0, s·z0)` × 4 | terrain | Destinations 0x208–0x250; see [Terrain materials](#terrain-materials) |
 | Terrain layer specular | `(r, g, b, power)` × 4 | terrain | Destinations 0x448–0x490 |
 | Water colour | `(r, g, b, a)`, dark, e.g. `(0.007, 0.009, 0.015, 0.7)` | water | Destination 0x430; `a` is 0.05–0.9, unknown |
+| Wire colour | `(r, g, b)`, linear, `(0.0014, 0.0014, 0.0014)` | wire | Destination 0xB8; the material's only constant |
 
 Many techniques also have a `(r, g, b, power)` row that looks like a specular colour and exponent
 (for example `(0.047, 0.047, 0.047, 50)` at 0x2F8 in `7bda1e1f`), colour multipliers, and
@@ -216,6 +224,7 @@ The largest groups and the special ones:
 | `ff0cafee` | 19 | `0x01` | 3 | Foliage models |
 | `b18b8189` | 17 | `0x00` | 4, 18, 255 | **Water**: flat planes of 10 m to 1 km |
 | `b9f18d99` | 5 | `0x00` | 3, 255 | Sky domes |
+| `bc705d52` | 1 | `0x00` | none | **Wire**: Baku's power cables (`172d080c`, 428 models; positions only, no UVs or normals) |
 
 `tools/material_check.py --techniques` prints all 62.
 
@@ -227,6 +236,11 @@ The largest groups and the special ones:
   the alpha channel is not opacity and stays unconnected. Before this decode, any colour texture
   with some transparent texels became a cut-out, which put holes in the Raven armour
   (`c1f9aedc`) and in other materials that store something else in alpha.
+  Only a base map whose alpha is opacity keeps Blender's *Straight* alpha (image `<hash>_alpha`).
+  Every other colour image is *Channel Packed* (`<hash>`; data images stay `<hash>_data`):
+  Blender premultiplies straight images, so their colour is lost wherever alpha is 0, and opaque
+  materials whose texture stores something else in alpha drew black (Baku's backdrop rocks
+  `623ce871` have alpha 0 everywhere). Workbench still needs *Straight* to show cut-outs.
 * **UV transform.** When it is not the identity, a *Material UV transform* Mapping node feeds the
   base colour, normal and specular maps (scale `(su, sv)`, location `(ou, 1 − sv − ov)` for
   Blender's flipped V). This affects 39 materials on the disc.
@@ -244,6 +258,8 @@ The largest groups and the special ones:
 * **Glass** (`f436de9a`): a clear, glossy, Blended surface (alpha 0.2), flag `mag_glass`.
 * **Water** (`b18b8189`): the water colour parameter as base colour, roughness 0.05, flag
   `mag_water`.
+* **Wire** (`bc705d52`): the wire colour parameter as base and viewport colour, flag `mag_wire`.
+  Before `MATERIAL_VERSION` 4 the cables were the default white.
 * Every material records its technique as `mag_technique`. `build.MATERIAL_VERSION` is stored as
   `mag_v`, so the materials an older importer left in a `.blend` are rebuilt, not reused.
 

@@ -16,7 +16,7 @@ from mathutils import Matrix, Quaternion
 from ..core import foliage as fol
 from ..core import level as lvl
 from ..core import lighting as lit
-from ..core.materials import VERTEX_LIT, WATER_COLOR
+from ..core.materials import VERTEX_LIT, WATER_COLOR, WIRE_COLOR
 from ..core.library import skeleton_world, fit_score
 from ..core.zrb import T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL, T_FOLIAGE_BATCH
 
@@ -209,7 +209,8 @@ def _preview_image(col):
 # Bump when the material build changes: a .blend's materials built by an older importer are then
 # rebuilt instead of reused.
 IMAGE_SLOTS = (3, 4, 5, 15, 16, 17, 255)  # binding slots _build loads images for
-MATERIAL_VERSION = 3  # 3: normal maps through the shared MAG Normal group
+MATERIAL_VERSION = 4  # 3: normal maps through the shared MAG Normal group; 4: base layer = lowest
+#                       binding offset, colour images Channel Packed unless alpha is opacity, wire colour
 
 
 class MaterialCache:
@@ -256,22 +257,26 @@ class MaterialCache:
         f = self.flags(h, near)
         return f is not None and bool(f & VERTEX_LIT)
 
-    def image(self, h, near, non_color=False):
-        """-> (bpy Image or None, metadata dict). Colour and data uses get separate datablocks."""
-        key = (h, non_color)
+    def image(self, h, near, non_color=False, opacity=False):
+        """-> (bpy Image or None, metadata dict). Colour, colour-with-opacity and data uses get
+        separate datablocks. Only ``opacity`` images (a base map whose alpha the material tests
+        or blends with) keep Straight alpha; the others are Channel Packed, because Blender
+        premultiplies straight images and so loses the colour wherever alpha is 0 (backdrop
+        rocks, roads and specular maps use alpha for something else and drew black)."""
+        key = (h, non_color, opacity)
         if key in self.images:
             return self.images[key]
         path, meta = self.lib.texture_file(h, near)
         img = None
         if path:
-            nm = '%08x%s' % (h, '_data' if non_color else '')
+            nm = '%08x%s' % (h, '_data' if non_color else '_alpha' if opacity else '')
             img = bpy.data.images.get(nm)
             if img is None:
                 img = bpy.data.images.load(path, check_existing=False)
                 img.name = nm
                 if non_color:
                     img.colorspace_settings.name = 'Non-Color'
-                    img.alpha_mode = 'CHANNEL_PACKED'
+            img.alpha_mode = 'STRAIGHT' if opacity else 'CHANNEL_PACKED'
             if getattr(self.opts, 'pack_textures', False) and img.packed_file is None:
                 try:
                     img.pack()
@@ -335,7 +340,9 @@ class MaterialCache:
             base_uv = mp.outputs['Vector']
             mat['mag_uv_transform'] = list(uvt)
         if 3 in b:
-            img, meta = self.image(b[3], mzrb)
+            has_alpha = bool(self.lib.texture_file(b[3], mzrb)[1].get('alpha'))
+            opacity = info.alpha_test or ((info.translucent or not info.parsed) and has_alpha)
+            img, meta = self.image(b[3], mzrb, opacity=opacity)
             if img:
                 n = nt.nodes.new('ShaderNodeTexImage')
                 n.image, n.label, n.location = img, 'Base Color', (-500, y)
@@ -421,6 +428,14 @@ class MaterialCache:
             bsdf.inputs['Roughness'].default_value = 0.05
             mat.diffuse_color = (0.04, 0.08, 0.1, 1.0)
             mat['mag_water'] = True
+        elif info.wire:
+            # power cables: no textures, a single linear colour parameter
+            wc = info.constant(WIRE_COLOR)
+            rgb = tuple(wc[:3]) if wc and len(wc) >= 3 else (0.002, 0.002, 0.002)
+            bsdf.inputs['Base Color'].default_value = rgb + (1.0,)
+            bsdf.inputs['Roughness'].default_value = 0.6
+            mat.diffuse_color = rgb + (1.0,)
+            mat['mag_wire'] = True
         # the viewport's Texture colour mode and texture painting show the active image node
         if base_node is not None:
             nt.nodes.active = base_node
@@ -1239,6 +1254,10 @@ def build_map(lib, level_index, opts, mcache, scene, progress=None):
     # scenery outside the playable terrain (mountains, treeline cards) goes to its own collection
     square = _terrain_square(lib, lv)
     centre = {h: _piece_centre(lib, *hits[h][1:]) for h in piece_coll}
+    # placed pieces get their own child collection: loose objects of map_coll are listed in the
+    # Outliner after its last child collection (the sky), as if they were part of it
+    placed = bpy.data.collections.new('MAG_%s_objects' % name)
+    map_coll.children.link(placed)
     backdrop = bpy.data.collections.new('MAG_%s_backdrop' % name)
     map_coll.children.link(backdrop)
     trs = lv['trs']
@@ -1251,7 +1270,7 @@ def build_map(lib, level_index, opts, mcache, scene, progress=None):
             continue
         G = lvl.trs_matrix(trs[i])
         M = Matrix(to_blender_matrix(G).tolist())
-        target = map_coll
+        target = placed
         if square is not None and centre.get(h) is not None:
             w = G[:3, :3] @ centre[h] + G[:3, 3]
             if lvl.outside_distance(w[0], w[2], square) > lvl.BACKDROP_MARGIN:

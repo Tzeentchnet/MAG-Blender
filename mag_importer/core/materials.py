@@ -78,6 +78,7 @@ VALUE_WORDS = {1: 1, 2: 1, 3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 8, 9: 12, 10: 16}
 TERRAIN = 0xF9F3BDA5        # terrain tile technique
 WATER = 0xB18B8189          # water planes (the only technique with engine parameters 31 and 32)
 GLASS = 0xF436DE9A          # translucent glass: normal + environment map, no colour texture
+WIRE = 0xBC705D52           # power cables (Baku): no textures, no UVs or normals, one colour
 
 # Pass-1 constant destinations with a known meaning, per technique:
 #   uv      (su, sv, ou, ov): uv' = uv * s + o for the base colour, normal and specular maps
@@ -117,6 +118,7 @@ TECHNIQUES = {
     0x96261A09: dict(uv=0x250),
 }
 WATER_COLOR = 0x430         # water: (r, g, b, a), a dark linear colour (a 0.05-0.9, unknown)
+WIRE_COLOR = 0xB8           # wire: (r, g, b), linear (0.0014 grey: near-black cables)
 
 TERRAIN_UV = (0x208, 0x220, 0x238, 0x250)    # four rows (s, s, s*x0, s*z0): s * uv0 + (c, d)
 TERRAIN_SPEC = (0x448, 0x460, 0x478, 0x490)  # four rows (spec r, g, b, power)
@@ -157,6 +159,10 @@ class MaterialInfo:
     def glass(self):
         return self.technique == GLASS
 
+    @property
+    def wire(self):
+        return self.technique == WIRE
+
     def constant(self, dest, mask=1):
         """Values of the first constant with this destination whose pass mask shares a bit with
         ``mask``, or None."""
@@ -196,15 +202,18 @@ def parse_material(payload, name, texture_hashes):
     m.parsed = _parse_structure(m, p)
     if not m.parsed:
         m.binding_table = _scan_bindings(p, texture_hashes)
-    found = {}  # slot -> (pass, hash)
+    # A slot bound more than once in a pass (roads, blended and tinted techniques) lists its
+    # layers by binding offset: the lowest offset is the base layer, the others are a second blend
+    # layer, a tint or ramp, or the 16x16 white placeholder 336759d8 / flat normal 75cb8229.
+    found = {}  # slot -> (pass, offset, hash)
     every = {}  # slot -> [(offset, hash)] of the first pass
     for h, ps, slot, cnt, off in m.binding_table:
         if ps == 1:
             every.setdefault(slot, []).append((off, h))
         prev = found.get(slot)
-        if prev is None or ps < prev[0]:
-            found[slot] = (ps, h)
-    m.bindings = {s: h for s, (ps, h) in found.items()}
+        if prev is None or (ps, off) < prev[:2]:
+            found[slot] = (ps, off, h)
+    m.bindings = {s: v[2] for s, v in found.items()}
     m.terrain = _terrain_layers(m, p, every)
     if m.terrain is not None:
         # the first colour/normal layer is not a tile texture: fall back to the tile's macro colour
