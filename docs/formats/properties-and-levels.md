@@ -50,6 +50,66 @@ Name hashes cannot be reversed, so readable names are mined from property object
 
 This yields 353 labels. Assets without one are shown as `<zrb stem>_<hash>`.
 
+`util::Token` values are the CRC32 (zlib) of their text, so tokens that name other table entries
+can be resolved by hashing the entries' `id` strings. Model hashes are not CRC32 of the `id`.
+
+### Weapon, attachment and head tables
+
+Code: `mag_importer/core/loadout.py`, stored in the index as `GameIndex.loadout`
+(INDEX_VERSION 15).
+
+| Object | File (`MAIN.PSARC`) | Fields used |
+| --- | --- | --- |
+| `WeaponData` | `equipment.zrb` | `id`; `model_name` = third-person model (has the stock); `required_sight_attachment` = token of the sight always fitted; `attachment_list` = `WeaponAttachment` objects whose `name` is the token of a compatible attachment |
+| `AttachmentData` | `equipment.zrb` | `id`; `attachment_type` enum; `model_name` = third-person model |
+| `StreamedItemData` | `streamed_weapons.zrb`, `streamed_attachments.zrb` | `id` → `model_name`, the first-person view model (weapons have no stock) |
+| `CharacterHeadDataTable` | `character_class.zrb` | `head_model_name` (the `B2922512` record) and one `CharacterHeadData` per head (`head_model_index`, `skin_tone`) |
+
+`attachment_type` and the weapon socket the attachment mounts on (the attachment model's origin
+is its mount point):
+
+| Value | Kind | Socket |
+| --- | --- | --- |
+| 1 | Grenade launcher (M203, M320, GP-30) | `underbarrel` |
+| 2 | Sight (iron sights, red dot, ACOG, scopes, rocket sights) | `sight` |
+| 3 | Muzzle (suppressors, muzzle brake) | `firepoint` |
+| 5 | Bipod | `underbarrel` |
+| 6 | Foregrip | `underbarrel` |
+| 9 | `half_skill` (no model) | — |
+
+Example, the M4 (`m4a1`): required sight `scope_ironsights_rear`; compatible
+`large_suppressor1_assault`, `scope_reddot_green_assault`, `scope_acog_green`, `foregrip_1`,
+`bipod_small_1`, `m203`. Vehicle weapons are `WeaponData` too (`hind_chin`, `nh90_turret`, …);
+the Hind's `TurretProperties.Weapon1` is `crc32("hind_chin")`, which has no model: the chin gun
+is the Hind's own turret nodes.
+
+Tokens hash the **lowercase** id: the HMMWV's turret names `crc32("m2hb_vehicle")` for the
+`WeaponData` id `M2HB_vehicle`.
+
+**Vehicle weapons.** `VehicleData` (`vehicles.zrb`) gives each vehicle's `ModelFileName` and
+`PropertiesFileName`, the name of its properties record (type `6DAF4680`, in the vehicle's own
+ZRB, e.g. `HeloVehicleProperties`). That record holds a `TurretList` of `TurretProperties`
+(`Weapon1`, `Weapon2` = weapon tokens) and a `SeatList` of `SeatProperties` (`Name` = the seat's
+turret node, `turret_01` / `turret_02`; `TurretIndex`). The NH90 and Pave Hawk door seats share
+turret 0.
+
+| Vehicle | Turret weapon | Model | Mounted |
+| --- | --- | --- | --- |
+| HMMWV, Cougar | `M2HB_vehicle` | `8BA621ED` | yes |
+| Panhard, Kangaroo | `Kord_vehicle` | `16AA2765` | yes |
+| Fennek, Maultier | `xm312_vehicle` | `FA3706C0` | yes |
+| Deployable turrets (`vehicle_degreen` / `deblack` / `dered`) | `minigun_<faction>` (+ `def_rocket_*`, no model) | minigun | yes |
+| NH90 | `nh90_turret` | `minigun_black` | no: the door guns are modelled on the turret |
+| Hind, Pave Hawk, Stryker, MRAV, BTR-80 | `hind_chin`, `pave_hawk_turret`, … | none | — (built into the vehicle) |
+
+The weapon model's origin is its pivot; the importer parents it to the seat turret's
+`turret_pitch` (`build.build_vehicle_weapons`). It skips a turret whose own meshes come within
+0.12 m of a `firepoint` under it, which marks a modelled gun (NH90 0.07 m, Hind 0.06 m; the
+Fennek's empty cradle 0.20 m).
+
+`CharacterClassInv` (`character_class.zrb`) gives each class's loadout as tokens
+(`Primary`, `PrimarySight`, `ApparelHead`, `Armor`, …), not used yet.
+
 ## Map placements (`<level>.clv`)
 
 Each level PSARC has one `.clv`: a stream of property objects. Static geometry is placed by

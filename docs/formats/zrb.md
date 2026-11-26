@@ -123,8 +123,10 @@ already find.
 * One name can appear in several ZRBs, for example the same texture in more than one level.
   Lookup prefers, in order: the same ZRB, the same archive, the MAIN archive, then any archive
   (`GameIndex.find` / `find_in_archive`).
-* The hash function is unknown. Readable names come from property tables and Havok source paths
-  (see [properties-and-levels.md](properties-and-levels.md)).
+* The asset name hash function is unknown. Readable names come from property tables and Havok
+  source paths (see [properties-and-levels.md](properties-and-levels.md)). Property
+  `util::Token` values and model node names, on the other hand, are plain CRC32 (zlib) of their
+  text (see [Weapon, attachment and head tables](properties-and-levels.md#weapon-attachment-and-head-tables)).
 
 ## How the scanner uses ZRBs
 

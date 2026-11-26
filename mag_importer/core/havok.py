@@ -121,6 +121,7 @@ class Animation:
         self.translations = None  # (tracks, frames, 3)
         self.rotations = None     # (tracks, frames, 4) xyzw
         self.scales = None        # (tracks, frames, 3)
+        self.additive = False     # binding blend hint ADDITIVE: tracks are deltas on a base pose
 
 
 def _align(o, a):
@@ -382,6 +383,9 @@ def summarize(pf):
     return out
 
 
+BLEND_HINT_ADDITIVE = 1  # hkaAnimationBinding +0x18 (i8 blendHint; 0 = normal)
+
+
 def read_animations(pf):
     """Decode every bound animation in the packfile."""
     anims = []
@@ -402,6 +406,7 @@ def read_animations(pf):
         an.skeleton_name = pf.cstr(o)
         an.duration = pf.f32(a + 0x0C)
         an.num_frames, an.frame_duration, an.translations, an.rotations, an.scales = res
+        an.additive = pf.d[o + 0x18] == BLEND_HINT_ADDITIVE
         tp, tn = pf.ptrs.get(o + 8), pf.i32(o + 12)
         if tp is not None and tn > 0:
             an.track_to_bone = list(struct.unpack_from(pf.e + '%dh' % tn, pf.d, tp))

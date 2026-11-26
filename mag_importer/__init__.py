@@ -7,7 +7,7 @@ weapons, props, vehicles and complete maps.
 bl_info = {
     'name': 'MAG Importer',
     'author': 'MAG-Blender',
-    'version': (1, 0, 0),
+    'version': (1, 1, 0),
     'blender': (4, 4, 0),
     'location': '3D Viewport > Sidebar > MAG',
     'description': 'Import characters, weapons, vehicles, props, maps and animations from the MAG (PS3) ISO',

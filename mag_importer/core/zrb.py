@@ -34,6 +34,7 @@ T_MODEL = 0xA4F4D23C          # hierarchical static model (weapons, vehicles, pr
 T_SKINNED_MODEL = 0x10B17150  # Edge skinned model (characters, gear)
 T_LEVEL_MODEL = 0x80DC0132    # level piece (Edge static partitions)
 T_FOLIAGE_MODEL = 0xB9F5747E  # instanced clutter model
+T_HEAD_MODEL = 0xB2922512     # character heads: every head variant in one skinned model (mesh flags = head index)
 T_FOLIAGE_BATCH = 0x03BE92A0  # instance batch of a foliage model
 T_HAVOK = 0xFB93282D          # Havok 6.x packfile (animations, skeletons)
 T_LIGHTING = 0x84DFB280        # baked per-vertex lighting of one placement (lighting.py)
@@ -41,7 +42,7 @@ T_TERRAIN = 0x284C2F78
 T_PARTICLE_EFFECT = 0x98057459  # particle effect (placed as an emitter by InstanceProperties)
 T_COLLISION = 0x2A8BDF5A       # collision mesh (Havok packfiles, physics.zrb)
 
-MODEL_TYPES = (T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL)
+MODEL_TYPES = (T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL, T_HEAD_MODEL)
 
 
 class Record:

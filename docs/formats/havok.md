@@ -62,8 +62,19 @@ Known skeletons include `root_main` (soldier body), `root_arms` (first-person ar
 | +0 | `char* originalSkeletonName` |
 | +4 | `hkaAnimation* animation` |
 | +8 / +12 | `i16* transformTrackToBoneIndices`, count |
+| +0x10 / +0x14 | `i16* floatTrackToFloatSlotIndices`, count |
+| +0x18 | `i8 blendHint`: 0 normal, 1 **additive** |
 
 If there is no track map, track *i* drives bone *i*.
+
+Additive clips (26 on the disc, all `root_main` and all named `a_*`: aim sweeps, recoils,
+flinches) hold deltas, not poses: translations are about zero and rotations near identity. The
+game layers them on the playing clip with Havok's additive blend (local rotation
+`base * delta`, translation `base + delta`, scale `base * delta`). Read as full poses, every
+bone collapses onto its parent. The first-person `a_fps_*recoil*` clips are normal (hint 0) full
+poses. The importer bakes an additive clip relative to the bind pose. On a rig that is already
+playing a normal clip, that clip moves to the `MAG base` NLA track and the additive clip plays
+on top with Combine blending.
 
 The packfile's `hkxScene` object (`+4`, a `char*`) holds the **Maya source path** of the
 animation. The importer uses the file stem as the animation's name.

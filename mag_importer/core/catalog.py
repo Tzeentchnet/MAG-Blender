@@ -17,18 +17,17 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from . import havok, level, props
+from . import havok, level, loadout, props
 from .errors import MagFormatError
 from .iso9660 import IsoFile
 from .psarc import Psarc
 from .zrb import (Zrb, header_span, T_TEXTURE, T_MATERIAL, T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL,
-                  T_FOLIAGE_MODEL, T_HAVOK, T_FOLIAGE_BATCH, T_TERRAIN, T_PARTICLE_EFFECT, T_LIGHTING,
-                  Record)
+                  T_FOLIAGE_MODEL, T_HEAD_MODEL, T_HAVOK, T_FOLIAGE_BATCH, T_TERRAIN, T_PARTICLE_EFFECT,
+                  T_LIGHTING, MODEL_TYPES, Record)
 
-INDEX_VERSION = 14
-KEEP_TYPES = {T_TEXTURE, T_MATERIAL, T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL, T_HAVOK,
-              T_FOLIAGE_BATCH, T_LIGHTING}
-MODEL_TYPES = (T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL)
+INDEX_VERSION = 16
+KEEP_TYPES = {T_TEXTURE, T_MATERIAL, T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL, T_HEAD_MODEL,
+              T_HAVOK, T_FOLIAGE_BATCH, T_LIGHTING}
 
 CATEGORIES = ('CHARACTER', 'WEAPON', 'ATTACHMENT', 'EQUIPMENT', 'VEHICLE', 'PROP', 'MAP', 'ANIMATION')
 
@@ -64,6 +63,7 @@ class GameIndex:
         self.havok = {}       # (zrb, rec) -> summary dict
         self.levels = []      # dict(name, archive, clv, mesh=np.uint32[N], trs=np.float32[N,9])
         self.fx = set()       # name hashes of particle effects (placements of these are emitters)
+        self.loadout = loadout.empty()  # weapon / attachment / head tables (core/loadout.py)
         self.assets = []      # AssetEntry
         self._by_name = None
 
@@ -73,7 +73,8 @@ class GameIndex:
             version=self.version, iso_path=self.iso_path, iso_size=self.iso_size, iso_mtime=self.iso_mtime,
             scan_seconds=self.scan_seconds, archives=self.archives,
             zrbs=[(z.archive, z.name, z.length, z.seg_start, z.seg_size, z.records, z.terrain) for z in self.zrbs],
-            labels=self.labels, havok=self.havok, levels=self.levels, fx=sorted(self.fx))
+            labels=self.labels, havok=self.havok, levels=self.levels, fx=sorted(self.fx),
+            loadout=self.loadout)
         tmp = path + '.tmp'
         with open(tmp, 'wb') as f:
             pickle.dump(blob, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -89,6 +90,7 @@ class GameIndex:
         for k in ('iso_path', 'iso_size', 'iso_mtime', 'scan_seconds', 'archives', 'labels', 'havok', 'levels'):
             setattr(idx, k, blob[k])
         idx.fx = set(blob['fx'])
+        idx.loadout = blob['loadout']
         for a, n, ln, ss, sz, recs, ter in blob['zrbs']:
             z = ZrbEntry()
             z.archive, z.name, z.length, z.seg_start, z.seg_size, z.records, z.terrain = a, n, ln, ss, sz, recs, ter
@@ -238,6 +240,8 @@ def scan_iso(iso_path, progress=None, workers=None):
                     tree = level.terrain_tree_levels(z.payload(r))
                     break
         labels = props.token_labels(data) if b'util::Token' in data else {}
+        lo = (loadout.scan(data, _stem(name), loadout.empty(), [(r.name, r.payload_off, r.end) for r in z.records])
+              if loadout.wants_scan(data) else None)
         hk = {}
         for ri, r in enumerate(ent.records):
             if r[7] != T_HAVOK:
@@ -251,7 +255,7 @@ def scan_iso(iso_path, progress=None, workers=None):
                 pass
         progress.step()
         fx = {r.name for r in z.records if r.type == T_PARTICLE_EFFECT}
-        return ent, labels, hk, tree, fx
+        return ent, labels, hk, tree, fx, lo
 
     def index_clv(job):
         ai, name = job
@@ -277,8 +281,10 @@ def scan_iso(iso_path, progress=None, workers=None):
     for res in results:
         if res is None:
             continue
-        ent, labels, hk, tree, fx = res
+        ent, labels, hk, tree, fx, lo = res
         idx.fx |= fx
+        if lo is not None:
+            loadout.merge(idx.loadout, lo)
         if tree:
             trees[ent.archive] = tree
         zi = len(idx.zrbs)
@@ -348,7 +354,7 @@ def _classify(zname, rtype):
     s = _stem(zname)
     if '/levels/' in zname:
         return 'PROP'
-    if rtype == T_SKINNED_MODEL:
+    if rtype in (T_SKINNED_MODEL, T_HEAD_MODEL):
         return 'CHARACTER'
     if s.startswith('streamed_weapons'):
         return 'WEAPON'
@@ -364,6 +370,7 @@ def _classify(zname, rtype):
 def build_catalog(idx):
     idx.assets = []
     seen = set()
+    roles = loadout.model_roles(idx.loadout)  # weapon / attachment models named by the equipment tables
     for zi, z in enumerate(idx.zrbs):
         stem = _stem(z.name)
         area = z.name.split('/levels/')[1].split('/')[0] if '/levels/' in z.name else 'global'
@@ -375,13 +382,20 @@ def build_catalog(idx):
                     continue
                 seen.add(key)
                 cat = _classify(z.name, rtype)
+                role = roles.get(name) if area == 'global' else None
+                if role:
+                    cat = role[0]
                 lab = idx.labels.get(name)
+                if rtype == T_HEAD_MODEL:
+                    lab = 'character_heads'
                 if not lab:
                     lab = stem.replace('streamed_', '').replace('vehicles_vehicle_', '') if cat in ('WEAPON', 'VEHICLE') else '%s_%08x' % (stem, name)
                     if cat in ('WEAPON', 'VEHICLE'):
                         lab = '%s_%08x' % (lab, name)
                 detail = '%s  [%s]' % (stem, {T_MODEL: 'model', T_SKINNED_MODEL: 'skinned', T_LEVEL_MODEL: 'level piece',
-                                              T_FOLIAGE_MODEL: 'foliage'}[rtype])
+                                              T_FOLIAGE_MODEL: 'foliage', T_HEAD_MODEL: 'heads'}[rtype])
+                if role and role[1]:
+                    lab += ' (1st person)'  # streamed view model: no stock, never seen from outside
                 if area != 'global':
                     detail = area + ' / ' + detail
                 idx.assets.append(AssetEntry('%d:%d' % (zi, ri), cat, lab, detail, zi, ri))

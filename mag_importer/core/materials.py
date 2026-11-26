@@ -118,6 +118,14 @@ TECHNIQUES = {
     0x96261A09: dict(uv=0x250),
 }
 WATER_COLOR = 0x430         # water: (r, g, b, a), a dark linear colour (a 0.05-0.9, unknown)
+# Water: one scalar each (5 and 10 on most; 0.8-3.1 on the seas). Read as the tile sizes in metres
+# of two world-space layers of the shared ripple normal map (a guess: water UVs are just 0-1 per
+# plane, whatever its size, so the game cannot tile by them). 0x478 (50-400) looks like a
+# specular power, 0x508 (1-10) is unknown.
+WATER_TILES = (0x4D8, 0x4F0)
+# Detail scales (su, sv) with max/min above this are treated as uniform (see detail_scale):
+# 9 materials have (100, 1), 4 (30, 0.25), one (21.986, 1) on the generic noise detail colour.
+DETAIL_MAX_RATIO = 8.0
 WIRE_COLOR = 0xB8           # wire: (r, g, b), linear (0.0014 grey: near-black cables)
 
 TERRAIN_UV = (0x208, 0x220, 0x238, 0x250)    # four rows (s, s, s*x0, s*z0): s * uv0 + (c, d)
@@ -180,14 +188,29 @@ class MaterialInfo:
         return v
 
     def detail_scale(self, slot):
-        """UV0 scale (su, sv) of detail slot 16 or 17, or None."""
+        """UV0 scale (su, sv) of detail slot 16 or 17, or None. A pair more lopsided than
+        DETAIL_MAX_RATIO (the MRAV's (100, 1) on its noise detail colour) becomes uniform at its
+        larger value: read literally it smears the tiny detail map into long streaks."""
         t = TECHNIQUES.get(self.technique)
         dests = t.get('detail', ()) if t else ()
         bound = [s for s in (16, 17) if s in self.bindings]
         if slot not in bound or len(dests) < len(bound):
             return None
         v = self.constant(dests[bound.index(slot)])
-        return v if v and len(v) == 2 and v[0] > 0.0 and v[1] > 0.0 else None
+        if not (v and len(v) == 2 and v[0] > 0.0 and v[1] > 0.0):
+            return None
+        if max(v) / min(v) > DETAIL_MAX_RATIO:
+            return (max(v), max(v))
+        return v
+
+    def water_tiles(self):
+        """Tile sizes (m) of the water normal map's two world-space layers (WATER_TILES), or
+        defaults when the material has none."""
+        out = []
+        for dest, default in zip(WATER_TILES, (5.0, 10.0)):
+            v = self.constant(dest)
+            out.append(v[0] if v and len(v) == 1 and v[0] > 0.05 else default)
+        return tuple(out)
 
 
 def parse_material(payload, name, texture_hashes):

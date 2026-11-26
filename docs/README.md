@@ -20,6 +20,7 @@ code wins and the document needs fixing.
 | [formats/textures-and-materials.md](formats/textures-and-materials.md) | GCM texture records, swizzling, DDS conversion; material records (header, texture bindings, shader parameters, techniques) and sampler slots |
 | [formats/havok.md](formats/havok.md) | Havok 6.5 packfiles, skeletons, animation bindings, spline-compressed animation |
 | [formats/properties-and-levels.md](formats/properties-and-levels.md) | Reflected property objects (`.zpr`, `.clv`), map placements, terrain tiles, foliage batches, asset naming |
+| [internals.md](internals.md) | The add-on itself: cache location and lifetime, speed, code layout, a format summary, developer tools |
 | [roadmap.md](roadmap.md) | Known gaps in the importer and the planned work on them |
 
 ## Summary
@@ -54,6 +55,7 @@ MAG (USA).dec.iso                    ISO9660 + Joliet
 | Skinned model | `10B17150` | Segments 3 and 4 | Edge partitions with a per-partition skinning palette |
 | Level piece | `80DC0132` | Segments 3 and 4 | Edge static partitions; terrain tiles are level pieces too |
 | Foliage model | `B9F5747E` | Segments 3 and 4 | Scattered clutter mesh |
+| Head model | `B2922512` | Segments 3 and 4 | Every character head in one skinned model; mesh flags = head index (see [models.md](formats/models.md#heads-b2922512)) |
 | Foliage batch | `03BE92A0` | Segments 3 and 4 | Instances of one foliage model; the origin is in the level's `.clv` (imported as Geometry Nodes instances) |
 | Terrain tree | `284C2F78` | Payload | The level's terrain LOD tree: one node per tile (decoded) |
 | Particle effect | `98057459` | Payload | Emitter definitions; map placements of emitters point at these |
@@ -81,8 +83,10 @@ MAG (USA).dec.iso                    ISO9660 + Joliet
 * **Byte order.** The game data is big-endian. The one exception is the Havok spline block data,
   which is little-endian (see [havok.md](formats/havok.md)).
 * **Hashes.** Type and name hashes are opaque 32-bit values. Dependency paths in ZRB headers use
-  CRC32 path hashes. Name hashes are *not* a known function of the asset name, so readable names
-  come only from property tables and Havok source paths.
+  CRC32 path hashes, and so do property `util::Token` values and model node names: they are the
+  CRC32 of their text (`crc32("scope_ironsights_rear")` = `767F2D49`). Model, material and
+  texture name hashes are *not* a known function of the asset name, so readable asset names come
+  only from property tables and Havok source paths.
 * **Coordinates.** The game is Y-up, right-handed, in metres. The importer maps
   `(x, y, z) → (x, −z, y)`, which is a proper rotation. Winding and handedness are preserved, and
   no mirroring is needed.
@@ -95,7 +99,7 @@ MAG (USA).dec.iso                    ISO9660 + Joliet
 | --- | --- |
 | Static models (weapons, vehicles, props) | Done: hierarchy, LODs, materials |
 | Skinned characters and gear | Done: Edge decode, skin weights, automatic skeleton fitting |
-| Animations | Done: spline and interleaved, matching game space within 0.1 mm |
+| Animations | Done: spline and interleaved, matching game space within 0.1 mm; additive clips layered on a base clip |
 | Textures | Done: DXT passed through unchanged as DDS, ARGB un-swizzled |
 | Materials | Done for the known parts: base, normal (DXT5nm or RGB), specular, detail normal and colour, alpha test with the game's reference, translucency, UV transform, water and glass by technique. Emissive, mask and environment slots and most shader constants are unused |
 | Maps: placed pieces | Done. Unresolved placements are reported as particle emitters (all maps) or missing pieces (one cut piece on Kennicott), optionally placed as empties |

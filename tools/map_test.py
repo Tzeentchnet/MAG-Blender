@@ -24,7 +24,7 @@ and vertices at the same position mostly share its value (far more often than ra
 it adds a close shot of the densest group of lit placements (use with ``eevee``). ``materials``
 counts the material kinds the header decode produces (alpha-tested, translucent, glass, water,
 UV transform, detail maps), checks their node wiring, and adds close shots of the largest glass,
-alpha-tested and detail-normal pieces (use with ``eevee``).
+alpha-tested and detail-normal pieces and of the widest water plane (use with ``eevee``).
 """
 import os
 import sys
@@ -360,12 +360,17 @@ if 'materials' in FLAGS:
         nodes = m.node_tree.nodes
         bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
         alpha_in = bsdf.inputs['Alpha'].links[0].from_node if bsdf and bsdf.inputs['Alpha'].is_linked else None
-        for k in ('mag_alpha_ref', 'mag_translucent', 'mag_glass', 'mag_water', 'mag_uv_transform',
+        for k in ('mag_alpha_ref', 'mag_soft_alpha', 'mag_translucent', 'mag_glass', 'mag_water', 'mag_uv_transform',
                   'mag_detail_normal', 'mag_detail_color'):
             if k in m:
                 kinds[k] += 1
         if 'mag_alpha_ref' in m:
             want = (m['mag_alpha_ref'] - 0.5) / 255.0
+            if m.get('mag_soft_alpha'):  # soft decal: (alpha test) x alpha, Blended
+                if m.surface_render_method != 'BLENDED':
+                    bad['soft alpha not blended'] += 1
+                alpha_in = next((l.from_node for l in alpha_in.inputs[0].links), None) \
+                    if alpha_in is not None and alpha_in.type == 'MATH' and alpha_in.operation == 'MULTIPLY' else None
             if not (alpha_in and alpha_in.type == 'MATH' and alpha_in.operation == 'GREATER_THAN'
                     and abs(alpha_in.inputs[1].default_value - want) < 1e-6):
                 bad['alpha test not wired'] += 1
@@ -404,6 +409,8 @@ if 'materials' in FLAGS:
             print('MAP materials shot %s at %s (size %.1f)' % (label, tuple(round(v, 1) for v in p), size))
 if water is not None and 'eevee' not in FLAGS:
     shots.append(('water', water + Vector((0, -0.01, 12)), water))
+elif water is not None and 'materials' in FLAGS:  # ripples and reflection, at a low angle
+    shots.append(('mat_water', water + Vector((12, -20, 7)), water))
 fol = [o for o in scene.objects if o.get('mag_foliage_model')]
 if fol:
     big = max(fol, key=lambda o: len(o.data.vertices))

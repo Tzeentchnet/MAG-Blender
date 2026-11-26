@@ -236,11 +236,23 @@ The largest groups and the special ones:
   the alpha channel is not opacity and stays unconnected. Before this decode, any colour texture
   with some transparent texels became a cut-out, which put holes in the Raven armour
   (`c1f9aedc`) and in other materials that store something else in alpha.
-  Only a base map whose alpha is opacity keeps Blender's *Straight* alpha (image `<hash>_alpha`).
+  Only the base map of a hard alpha test keeps Blender's *Straight* alpha (image `<hash>_alpha`).
   Every other colour image is *Channel Packed* (`<hash>`; data images stay `<hash>_data`):
   Blender premultiplies straight images, so their colour is lost wherever alpha is 0, and opaque
   materials whose texture stores something else in alpha drew black (Baku's backdrop rocks
   `623ce871` have alpha 0 everywhere). Workbench still needs *Straight* to show cut-outs.
+* **Soft alpha.** A reference of at most 10 (`build.SOFT_ALPHA_REF`; 107 materials on the disc
+  use 1) only discards empty texels of a soft-alpha decal: rust streaks such as Baku's chimney
+  streaks `f2ed7634`, posters `27799487`. These multiply the test by the texture alpha, are
+  Blended and Channel Packed, flag `mag_soft_alpha`. Before `MATERIAL_VERSION` 5 they were hard
+  cut-outs with Straight alpha: faint texels lost their colour (black poster edges), and EEVEE
+  drew the Dithered streak shell lying on the chimney black (Cycles did not).
+  **Except DXT1 base maps**: their alpha is 1-bit, so a reference of 1 is an exact cut-out
+  (Dithered, Straight alpha). 59 of these materials are plank walls with `7bda1e1f`, such as
+  Kennicott's `b836f2e6` and `468296cf`. Blended (`MATERIAL_VERSION` 5–6), EEVEE does not
+  depth-sort them, so whole buildings showed their far walls and floors through the near walls.
+  Header `+0x07` bit `0x40` is clear on all of them and set only on DXT5 soft decals.
+  Alpha-tested, translucent and glass materials use transparent shadows.
 * **UV transform.** When it is not the identity, a *Material UV transform* Mapping node feeds the
   base colour, normal and specular maps (scale `(su, sv)`, location `(ou, 1 − sv − ov)` for
   Blender's flipped V). This affects 39 materials on the disc.
@@ -255,9 +267,22 @@ The largest groups and the special ones:
 * **Detail colour (17).** Sampled at `uv0 · d`. The base colour is multiplied by
   `(2 · detail)^2.2`: 2× around mid-grey (the detail textures average 0.5), with the exponent
   because the game presumably blends gamma-space values.
+* **Lopsided detail scales.** A detail scale `(su, sv)` with max/min above 8
+  (`materials.DETAIL_MAX_RATIO`) becomes uniform at its larger value. On the generic 64×64 noise
+  detail colour `8c84b14b`, 9 materials have `(100, 1)` (the MRAV hull `d6438ad0`, `f6e6ac88`,
+  `0aa95356`), 4 have `(30, 0.25)` and one has `(21.986, 1)`. Read literally, these smear the noise
+  into long high-contrast streaks. What the second value really means is unknown.
 * **Glass** (`f436de9a`): a clear, glossy, Blended surface (alpha 0.2), flag `mag_glass`.
 * **Water** (`b18b8189`): the water colour parameter as base colour, roughness 0.05, flag
-  `mag_water`.
+  `mag_water`. All 17 water materials share the ripple normal map `9b6b471a`. It is DXT5nm
+  (X in alpha, Y in green; blue copies green). Red holds something else, so the format guess (red
+  and blue near 0) read it as an RGB normal. The tilted normals that gave looked like swirling
+  oil (Kennicott puddles `6e9fb875`). The UVs of water planes run 0–1 whatever the plane's size
+  (10 m puddles to 1 km seas), so the map is tiled in **world space** instead: two layers with
+  tile sizes in metres from the scalars `0x4D8` and `0x4F0` (5 and 10 on most, 0.8–3.1 on the
+  seas; `materials.WATER_TILES`, a guess), summed like a detail normal at Normal Map strength 0.3
+  (`build.WATER_NORMAL_STRENGTH`), flag `mag_water_tiles`. The mask in slot 255 (`34d830c6`,
+  cloudy noise) stays unconnected.
 * **Wire** (`bc705d52`): the wire colour parameter as base and viewport colour, flag `mag_wire`.
   Before `MATERIAL_VERSION` 4 the cables were the default white.
 * Every material records its technique as `mag_technique`. `build.MATERIAL_VERSION` is stored as

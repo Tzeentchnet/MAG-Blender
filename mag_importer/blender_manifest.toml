@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "mag_importer"
-version = "1.0.0"
+version = "1.1.0"
 name = "MAG Importer"
 tagline = "Import MAG (PS3) characters, weapons, vehicles, maps, animations"
 maintainer = "MAG-Blender"

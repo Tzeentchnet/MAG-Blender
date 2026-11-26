@@ -11,6 +11,7 @@ Four record types share one model serialization:
 | `10B17150` | Skinned characters and gear | Edge partitions with skinning |
 | `80DC0132` | Level pieces, terrain tiles, sky | Edge static partitions |
 | `B9F5747E` | Foliage models | Edge or RSX |
+| `B2922512` | Character heads (one record holding every head) | Edge partitions with skinning |
 
 A mesh uses Edge when its partition count is non-zero. Otherwise it is a plain RSX buffer pair.
 
@@ -78,6 +79,24 @@ docstring matches them).
 LODs. If a model has nothing for the requested LOD, the importer falls back to the lowest LOD
 that is present.
 
+LODs are chosen **per node**, as the game must do: a node with no mesh for the requested LOD
+shows its finest coarser LOD. Vehicles depend on this. The Hind's chin turret (`turret_yaw`,
+`turret_pitch`) and the wheels of the HMMWV, Cougar, Stryker, BTR-80, Panhard, Kangaroo and
+Fennek only have LOD 1 and LOD 2 meshes; at LOD 3 the wheels are merged into the body mesh. The
+exception is a model that keeps each LOD of a part on its own node at the same place (the rear
+iron sight, the AUG, the minigun barrels): when another node at the same world transform has
+meshes for the LOD, the node stays empty. 17 of the 425 static models have nodes without LOD 0
+(`build._node_selection`).
+
+Four nodes have the opposite slip: a small LOD 0-only detail mesh while the part itself is flagged
+for LOD 1 only (the Panhard and Kangaroo gun pintle, 33 vertices at LOD 0 and 1,603 at LOD 1;
+one ability prop body). The healthy pattern, as on the Hind's body, is a LOD 0 add-on plus a base
+mesh flagged for LOD 0 and 1. When a node's selection has fewer than a quarter of the vertices of
+its next coarser LOD (and that LOD has over 200), the coarser meshes are added, unless a
+`firepoint` under the node lies inside their bounding box. That case is the Fennek: its LOD 1
+turret is a closed housing standing in for the gun, while at LOD 0 an open 104-vertex cradle
+holds the separately mounted XM312.
+
 ### Node table (static models `A4F4D23C` only)
 
 The node table starts right after the last mesh entry:
@@ -100,7 +119,31 @@ Parents always come before their children. The table is thrown away when any par
 is out of bounds. Models without a node table get a single node holding every mesh.
 
 Leaf nodes with no meshes are attachment helpers. The importer deletes them to keep the scene
-tidy.
+tidy, except the sockets it mounts weapon attachments on.
+
+Node names are CRC32 hashes of short names. Known ones (`loadout.NODE_NAMES`):
+
+| Name | Hash | Where |
+| --- | --- | --- |
+| `firepoint` | `549D0CC2` | Muzzle (weapons, suppressors, launchers, vehicle guns) |
+| `sight` | `89AA5CA4` | Sight mount on weapons |
+| `underbarrel` | `E20C52FF` | Foregrip, bipod and grenade launcher mount |
+| `eject` | `94CF9CCD` | Shell ejection port |
+| `handik` | `0B4FF99B` | Left-hand IK target (weapons, foregrips, launchers) |
+| `mag`, `trigger` | `107E2F7C`, `1A6B0F5D` | Moving parts of first-person weapons |
+| `turret_01` → `turret_yaw` → `turret_pitch` | `CE1CE4F9`, `1D3CB655`, `634C95A2` | Vehicle turret chain |
+| `gunner_seat`, `driver_seat` | `6AF7EADC`, `DAF6D0F3` | Vehicle seats |
+
+## Heads (`B2922512`)
+
+The characters' bodies (`ArmorItemData` models on `root_main`) have no head. Every head is in
+one record of its own type, `B2922512`, in `character_class.zrb`, named by
+`CharacterHeadDataTable.head_model_name` (`6FCC518F`). It uses the ordinary model serialization
+and decodes like a skinned model: 45 meshes = 15 heads × 3 LODs (masks 01, 02, 04), Edge
+partitions skinned to about 10 head and neck bones of `root_main`. The mesh entry's u16 `flags`
+(+8) is the head index, which `CharacterHeadData.head_model_index` refers to along with a
+`skin_tone` enum (0, 1 or 2). The importer builds a *Heads* collection on the body's rig
+(`build.build_heads`), head 0 shown.
 
 ## Segment walking
 
@@ -269,4 +312,5 @@ Skinned models do not name their skeleton. The importer scores each Havok skelet
 its bind pose matches the mesh: for each bone, it measures the distance from the centroid of the
 vertices dominated by that bone to the bone or to its child segments. The skeleton with the
 lowest median distance wins. Results include `root_main` for bodies, `root_arms` for
-first-person arms and `chute_root` for parachutes.
+first-person arms and `chute_root` for parachutes. The head record is put on `root_main` without
+scoring.

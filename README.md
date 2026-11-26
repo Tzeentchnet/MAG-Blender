@@ -10,7 +10,7 @@ Tested with Blender 5.2.2 LTS and `MAG (USA).dec.iso` (retail v1.0, BCUS98110). 
 ## Install
 
 ```
-python tools/build_extension.py        # -> dist/mag_importer-1.0.0.zip
+python tools/build_extension.py        # -> dist/mag_importer-1.1.0.zip
 ```
 
 In Blender: *Edit → Preferences → Get Extensions → (▾) Install from Disk…* and pick the zip.
@@ -26,10 +26,11 @@ You can also use *Add-ons → Install…* for a legacy install. Either way the p
 
 | Category | What you get |
 | --- | --- |
-| Characters | Skinned soldier and armor models, plus an armature fitted automatically (`root_main` body, `root_arms` first-person arms, `chute_root` parachute) |
-| Weapons, Attachments, Gear, Vehicles, Props | The node hierarchy as objects, with meshes and materials |
+| Characters | Skinned soldier and armor models, plus an armature fitted automatically (`root_main` body, `root_arms` first-person arms, `chute_root` parachute). Bodies come with a *Heads* collection: all 15 heads on the same rig, head 0 shown, the others hidden (toggle them in the Outliner) |
+| Weapons | Third-person models (with stock) and the *(1st person)* view models, each with its attachments mounted on the sockets: the required sight is shown, the other compatible attachments (scopes, suppressor, foregrip, bipod, grenade launcher) wait hidden in an *Attachments* collection |
+| Attachments, Gear, Vehicles, Props | The node hierarchy as objects, with meshes and materials. Vehicles keep their wheels and turrets at LOD 0 (the game only has LOD 1+ meshes for them), and their turret machine guns are mounted (M2HB, Kord, XM312, the deployable turrets' miniguns) unless the gun is part of the vehicle model |
 | Maps | Every placed piece as a collection instance, the terrain, the scenery outside the terrain (mountains, treeline cards) in a separate backdrop collection, the sky as the scene World, the baked vertex lighting of trees and bushes, and optionally the collision meshes |
-| Animations | A Blender action on the matching armature (the active one if it fits, otherwise a new one) |
+| Animations | A Blender action on the matching armature (the active one if it fits, otherwise a new one). Additive clips (`a_*` aim sweeps, recoils, flinches) play on top of the rig's current clip, which moves to the *MAG base* NLA track; import a normal clip first to choose the base. Characters can also bring their animations with them: see the **Animations** option |
 
 ### Options (Import Options sub-panel)
 
@@ -51,6 +52,12 @@ restarts. The other options are stored per scene.
   transform. Normal maps can be DXT5nm or RGB; the add-on detects which.
 * **Flip Normal Green**: inverts the Y channel of the normal maps.
 * **Skeleton**: *Automatic* scores each skeleton's bind pose against the mesh, or you can force one.
+* **Animations** (characters): *None* (default) imports the bind pose only. *Idle* adds the
+  skeleton's idle clip as an action (`stand_p_idle` for third-person bodies, `fps_idle` for
+  first-person arms). *All* adds every clip of the skeleton (461 for bodies, about 6 s; 208 for
+  arms). **Filter** keeps only the clips whose name contains its text (for example `reload` or
+  `stand_p_`). The idle clip (or the first clip) is assigned and sets the scene frame range. The
+  others keep a fake user, so switch them in the Action Editor.
 * **Set Scene to 30 fps**: MAG animations are authored at 30 fps.
 * **Terrain**: imports the terrain tiles of one level of the terrain's LOD tree.
   * **LOD**: 0 (default) is the finest level. Each step up halves the tile count with coarser
@@ -79,109 +86,6 @@ restarts. The other options are stored per scene.
   `col_terrain` and a `col_<hash>` object per placed piece that has collision (linked duplicates
   of one mesh per shape). They are drawn as orange wireframe and hidden from renders; the
   collision includes the invisible boundary walls around the playable area.
-
-## The cache survives restarts, upgrades and resets
-
-The index (`mag_index.pkl`, about 14 MB) and the converted textures are stored in Blender's
-per-user folder, next to the per-version folders rather than inside one, for example
-`%APPDATA%\Blender Foundation\Blender\mag_importer\`. The ISO path is saved there too, in
-`settings.json`. As a result:
-
-* restarting Blender reloads the index automatically, in about 0.1 s, and opening a .blend
-  refills the asset list;
-* upgrading Blender (5.2 to 5.3...) keeps the cache: every version uses the same folder;
-* the import options kept in the preferences (Lower LODs, Lightmaps, Collision, Pack Textures)
-  are mirrored into `settings.json`, so they come back even if Blender's preferences are not
-  saved;
-* *Load Factory Settings* and reinstalling the add-on keep it;
-* if the ISO changes (path, size or modification time), you are asked to rescan.
-
-Textures are converted to DDS once and then reused. DXT data is stored unchanged, so Blender's
-GPU decodes it. Preferences can move the cache to another folder.
-
-Older versions of the add-on kept the cache in `...\Blender\<version>\config\mag_importer\`. The
-first start moves the newest such cache to the shared folder. Opening a .blend whose textures
-point at a cache location that no longer exists relinks them to the current cache.
-
-## Speed
-
-* Indexing reads only the record table (segment 0) of each ZRB: the PSARC reader inflates only
-  the 64 KiB blocks it needs, and a thread pool spreads the work (zlib releases the GIL).
-* All vertex decoding is vectorized with numpy: half floats, RSX CMP normals, Edge spherical
-  normals and skin influences.
-* Mesh data reaches Blender through `foreach_set` bulk calls.
-* Havok spline curves are evaluated for all frames at once (vectorized B-spline basis).
-  All 568 character animations decode in about 2 seconds.
-* Maps prefetch and decompress their resource blocks in parallel, build each unique piece once,
-  and place it with collection instances. A full map takes 2–8 seconds (Baku, the largest,
-  about 7 s).
-* The first import of a map converts its missing textures in parallel, and only the DXT blocks
-  sampled for the alpha/normal check are decoded. With an empty texture cache, Baku takes about
-  9 s instead of 17 s.
-* Materials share node groups (*MAG Terrain*, *MAG Normal*) instead of rebuilding the same maths
-  in every material.
-* `tools/profile_import.py` profiles a character, animations, a vehicle and a map (cProfile, per
-  stage, warm or cold texture cache, optional first EEVEE frame).
-* Decompressed blocks are kept in an LRU cache (768 MB).
-
-## Layout
-
-```
-mag_importer/
-  core/            pure Python + numpy readers (no bpy; testable outside Blender)
-    iso9660.py     ISO9660 + Joliet
-    psarc.py       PSARC 1.3 with partial block extraction
-    zrb.py         ZRB resource-block container
-    models.py      model records, RSX vertex buffers, Edge partitions, skinning palettes
-    vertex.py      vectorised attribute codecs
-    textures.py    GCM textures -> DDS, DXT/ARGB decoders, un-swizzle
-    materials.py   material header, texture bindings, shader constants
-    havok.py       Havok 6.x packfiles, skeletons, spline-compressed animations
-    props.py       reflected property objects (.zpr tables, .clv)
-    level.py       map instance placements
-    catalog.py     scanning + persistent index + asset catalog
-    library.py     resource access, LRU cache, texture cache, skeleton fitting
-  blender/         Blender side (UI, operators, mesh/material/armature/action builders)
-tools/             validation and test scripts (see below)
-```
-
-## Format notes (reverse engineered for this add-on)
-
-* **ZRB**: a 0x30-byte header with five segments: records, CPU data, (unused), RSX data and
-  Edge geometry. Records are `6, 0x600DF00D, end, kind, seg1..seg4 offsets, type hash,
-  name hash, payload`.
-* **Types**: texture `85CE0660`, material `7CBE7595`, model `A4F4D23C`, skinned model
-  `10B17150`, level piece `80DC0132`, foliage `B9F5747E`, Havok `FB93282D`.
-* **Models**: a byte-packed serialization. Each mesh entry is 149 bytes (LOD mask, vertex and
-  index counts, vertex format, RSX size, Edge size, material hash), followed by a node table
-  (local quaternion and translation, mesh ranges, parents).
-* **RSX static meshes**: `[vertex buffer] pad 0x80 [u16 triangle list] pad 0x80`.
-  Format bits: `0x1` position half3, `0x2` CMP normal, `0x8` tangent half4, `0x80` colour,
-  `0x200` / `0x400` UVs.
-* **Edge partitions**: a 0x100-byte header of 24 u16 stream sizes, then config, secondary
-  format, indices, positions, normals/tangents, influences and format tables. The skin palette
-  is `skinMatricesByteOffsets[2]` at h10/h11 and `skinMatricesSizes[2]` at h12/h13, as 48-byte
-  3×4 matrices.
-* **Materials**: a 0x80-byte header (alpha test + reference, render group bits, technique hash,
-  binding count, vertex attributes), 14-byte texture bindings, then `0xDEADBEEF`-tagged engine
-  parameters, constant parameters with their float values, and pass records. Constants have no
-  names; their meaning is per technique (62 on the disc).
-* **Textures**: GCM format 5/6/7/8 = A8R8G8B8/DXT1/DXT3/DXT5. Pitch 0 means a swizzled (Morton)
-  ARGB texture.
-* **Animations**: Havok 6.5 `hkaSplineCompressedAnimation`. The block data is little-endian even
-  on PS3, while the packfile itself is big-endian.
-* **Maps**: `InstanceProperties` objects in `<level>.clv` hold the Mesh token plus T/R(deg)/S.
-  The rotation order is `Rz·Ry·Rx`. Terrain tiles are world-space level pieces arranged in a
-  binary LOD tree of right triangles (the `284C2F78` record in `globaldata.zrb`); the import
-  keeps one level of it (the leaves by default).
-  Foliage batches (`03BE92A0`) hold 16-byte instance rows (offset, scale, xyzw quaternion as
-  rebased halves) and RGBA8 colours; the batch origin is an 81-byte entry in the `.clv`.
-  Baked lighting (`84DFB280`) is one record per lit placement, named at +166 after its
-  `InstanceProperties` object: 4 bytes `(0, sky, 0, sun)` per vertex of the meshes whose material
-  has flag `0x10000000` (u32 at +0x28). For 15 models the meshes sit at other offsets with extra
-  entries between them; the importer finds those offsets from the data.
-* Asset names come from the game's own property tables (`model_name`, `Model`,
-  `ModelFileName`…) and animation names from the Maya source paths stored in the Havok files.
 
 ## Limitations
 
@@ -214,25 +118,8 @@ tools/             validation and test scripts (see below)
   refraction. Workbench's *Texture* mode draws them from an unconnected 1×1 *Viewport colour*
   image.
 
-## Developer tools
+## More
 
-```
-python tools/scan_cli.py "MAG (USA).dec.iso" index.pkl        # scan outside Blender, print the catalog
-python tools/validate_models.py store.pkl ...                 # decode every model, report statistics
-blender -b --factory-startup -P tools/blender_e2e.py -- ISO OUT [map]     # import one of each category
-blender -b --factory-startup -P tools/map_test.py -- ISO OUT baku         # import + render a map (flags: foliage fx eevee terrain macro lodN fade nomacrofade sky skydome nosky collision light nolight)
-blender -b --factory-startup -P tools/anim_check.py -- ISO anim frame     # pose vs game-space skeleton
-python tools/dump_record.py baku globaldata.zrb --list        # list / hex-dump records of any type
-python tools/missing_pieces.py [level ...]                    # explain unresolved map placements
-python tools/terrain_check.py baku canal                      # terrain layer order / UV continuity
-python tools/sky_check.py                                     # sky dome mapping, every level
-python tools/collision_check.py [level ...]                   # collision decode + placement, every level
-python tools/lighting_check.py [level ...]                    # baked lighting references, layout, seams
-python tools/baseline.py [--write] [level ...]                # regression baselines (counts, model digests)
-blender -b --factory-startup -P tools/sky_test.py -- ISO OUT baku kennicott  # sky World vs Dome renders
-```
-
-`dump_record.py` and `missing_pieces.py` read the disc through the add-on's cached index.
-
-`anim_check.py` compares Blender's evaluated pose with the skeleton composed in game space. The
-current build matches within 0.1 mm.
+How the cache works, what makes imports fast, the code layout, a summary of the formats and the
+developer tools are in [docs/internals.md](docs/internals.md). The full format notes are in
+[docs/README.md](docs/README.md).

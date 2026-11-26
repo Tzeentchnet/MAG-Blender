@@ -384,12 +384,53 @@ is in [textures-and-materials.md](formats/textures-and-materials.md#material-rec
   colour and exponent, plus tints and scalars. Naming them needs the technique's programs (not in
   the material: a separate shader resource, `+0x38` at run time) or more correlation with the
   textures.
-* **Glass and water shading.** Both are plain Principled approximations. The glass and water
-  constants (wave directions, fresnel-like rows, the water colour's alpha) and the environment
-  cube (slot 18, not on the disc) are not used.
+* **Glass and water shading.** Both are plain Principled approximations. Water ripples are
+  tiled in world space from two guessed tile-size scalars (`0x4D8`, `0x4F0`). The other glass and
+  water constants (`0x478` 50–400, perhaps a specular power; `0x508`; the water colour's alpha), the
+  slot-255 mask and the environment cube (slot 18, not on the disc) are not used.
+* **Detail scale second value.** 14 materials have detail-colour scales such as `(100, 1)`; the
+  importer makes them uniform (`DETAIL_MAX_RATIO`), because what `sv` means there is unknown.
 * **Pass records** and the remaining header bytes (+0x04, +0x07, +0x0C, +0x16) are not decoded.
 * **Detail colour order.** `53126094` has two detail scales for slots 16 and 17; which is which is
   a guess (slot order).
+
+---
+
+## Assembled assets: vehicle LODs, heads, weapon attachments — done
+
+Reported: the Hind had no chin turret, characters had no head, and the M4 had no stock and looked
+unfinished around the barrel.
+
+* **Per-node LODs.** The Hind's turret nodes only have LOD 1+ meshes, and the importer chose LODs
+  per model, so LOD 0 dropped them. The same happened to the wheels of seven ground vehicles and
+  the turrets of the Maultier, NH90 and Pave Hawk. LODs are now chosen per node
+  (`build._node_selection`, see [models.md](formats/models.md#mesh-entry-149-bytes)).
+* **Heads.** Heads are a separate record type, `B2922512` (15 heads × 3 LODs), now indexed
+  (INDEX_VERSION 15). Third-person bodies get a *Heads* collection on their rig, head 0 shown;
+  the record is also listed as *character_heads*.
+* **Weapons.** `util::Token` values turned out to be CRC32 of their text, which resolves the
+  equipment tables (see
+  [properties-and-levels.md](formats/properties-and-levels.md#weapon-attachment-and-head-tables)).
+  The *WEAPON* list now has the third-person models (with stock) next to the first-person view
+  models, which are labelled *(1st person)* and have no stock by design. Importing a weapon mounts
+  its required sight and adds every compatible attachment, hidden, on the right socket. The M4's
+  "incomplete" look was the missing rear sight.
+* **Vehicle weapons** (INDEX_VERSION 16): the turret machine guns are mounted on their
+  `turret_pitch` from the vehicle properties records (HMMWV/Cougar M2HB, Panhard/Kangaroo Kord,
+  Fennek/Maultier XM312, the deployable turrets' miniguns). Vehicles whose turret already models
+  the gun (NH90, Hind) get nothing. The Panhard/Kangaroo pintle was only a LOD 1 mesh behind a
+  tiny LOD 0 detail; the per-node rule now adds such a base, except where it is a stand-in for a
+  mounted gun (the Fennek's LOD 1 housing) (see
+  [models.md](formats/models.md#mesh-entry-149-bytes)).
+* Checked with `tools/assembly_test.py` (renders in `E:/tests/mag/assembly`); baseline rewritten
+  (one new model record).
+
+### Follow-ups
+
+* Skin tones: the body's `ArmorItemData.replacement_skin_mats` swaps the arm skin to match the
+  head's `skin_tone`; the importer keeps the body's default skin.
+* `CharacterClassInv` loadouts (default weapon, sight, head and face apparel per class).
+* Names of the three `skin_tone` values.
 
 ---
 
@@ -439,7 +480,7 @@ These are smaller or lower-priority items found while documenting the formats.
   counts, backdrop count (the importer's rule), foliage batches/table/instances per model, sky
   piece. Per ZRB: model, mesh and failure counts and a digest of every decoded model (geometry
   rounded to 1e-4). `--write` stores the current results; level names limit the run; `--no-models`
-  skips the digests. Baseline at INDEX_VERSION 14: 15 levels, 20,350 models in 7,577 ZRBs, no
+  skips the digests. Baseline at INDEX_VERSION 16: 15 levels, 20,351 models in 7,578 ZRBs, no
   decode failures, plus per-level baked lighting counts (records, referencing placements, layout
   matches). Run it before and after any change to decoding or level code, and rewrite it
   when a change is intended.

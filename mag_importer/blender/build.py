@@ -16,11 +16,11 @@ from mathutils import Matrix, Quaternion
 from ..core import foliage as fol
 from ..core import level as lvl
 from ..core import lighting as lit
+from ..core import loadout
 from ..core.materials import VERTEX_LIT, WATER_COLOR, WIRE_COLOR
 from ..core.library import skeleton_world, fit_score
-from ..core.zrb import T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL, T_FOLIAGE_BATCH
-
-MODEL_TYPES = (T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL)
+from ..core.zrb import (T_MODEL, T_SKINNED_MODEL, T_LEVEL_MODEL, T_FOLIAGE_MODEL, T_FOLIAGE_BATCH, T_HEAD_MODEL,
+                        MODEL_TYPES)
 C3 = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
 C4 = np.eye(4)
 C4[:3, :3] = C3
@@ -75,6 +75,8 @@ class ImportOptions:
         self.baked_lighting = True     # apply the map's baked per-vertex lighting (84DFB280)
         self.lower_lods = False        # also import the coarser LODs (hidden sub-collections)
         self.pack_textures = False     # pack the cached DDS files into the .blend
+        self.animations = 'NONE'       # skinned models: 'NONE', 'IDLE' (one clip) or 'ALL' clips of the skeleton
+        self.anim_filter = ''          # 'ALL': only clips whose name contains this text
         self.__dict__.update(kw)
 
 
@@ -87,6 +89,91 @@ def _select_meshes(model, geoms, lod):
             if chosen:
                 break
     return set(chosen)
+
+
+def _in_lod(me, k):
+    return bool(me.lod_mask & (1 << k)) or me.lod_mask == 0
+
+
+def _effective_lod(model, geoms, lod):
+    """``lod``, or the lowest LOD present when the model has nothing for it."""
+    have = [me for i, me in enumerate(model.meshes) if geoms[i] is not None]
+    if any(_in_lod(me, lod) for me in have):
+        return lod
+    return next((k for k in range(8) if any(me.lod_mask & (1 << k) for me in have)), lod)
+
+
+def _node_worlds(model):
+    W = {}
+    for n in model.nodes:
+        L = np.eye(4)
+        L[:3, :3] = qmat(n.rotation)
+        L[:3, 3] = n.translation
+        W[n.index] = W[n.parent] @ L if n.parent in W else L
+    return W
+
+
+def _node_selection(model, geoms, lod):
+    """node index -> mesh indices to import for a LOD.
+
+    The game picks a LOD per node: a node with nothing for ``lod`` shows its finest coarser LOD.
+    Vehicles rely on it (the Hind's chin turret and the HMMWV's wheels only have LOD1+ meshes).
+    Some models instead keep each LOD of a part on its own node at the same place (the rear iron
+    sight, the AUG, the minigun barrels); there another node at the same world transform has the
+    LOD, and the node stays empty."""
+    spans = {n.index: range(n.mesh_start, n.mesh_start + n.mesh_count) for n in model.nodes}
+    sel = {n: [i for i in sp if geoms[i] is not None and _in_lod(model.meshes[i], lod)] for n, sp in spans.items()}
+    if len(spans) < 2:
+        return sel
+    W = None
+    native = {n for n, ids in sel.items() if ids}  # nodes with meshes of this LOD before any fallback
+    for n, sp in spans.items():
+        if sel[n] or not any(geoms[i] is not None for i in sp):
+            continue
+        if W is None:
+            W = _node_worlds(model)
+        if any(m != n and np.allclose(W[m], W[n], atol=1e-4) for m in native):
+            continue
+        for k in range(lod + 1, 8):
+            ids = [i for i in sp if geoms[i] is not None and model.meshes[i].lod_mask & (1 << k)]
+            if ids:
+                sel[n] = ids
+                break
+    # A LOD-only detail mesh whose base part is flagged for the next LOD only (the Panhard and
+    # Kangaroo gun pintle: 33 verts at LOD 0, 1603 at LOD 1): add the base. Not when the coarser
+    # mesh reaches a firepoint under the node: that is a stand-in for a separately mounted gun
+    # (the Fennek's LOD 1 turret is a closed housing; at LOD 0 an open cradle holds the XM312).
+    fp_hash = loadout.token('firepoint')
+    for n in native:
+        sp = spans[n]
+        have = sum(model.meshes[i].V for i in sel[n])
+        for k in range(lod + 1, 8):
+            ids = [i for i in sp if geoms[i] is not None and model.meshes[i].lod_mask & (1 << k)]
+            if ids:
+                more = sum(model.meshes[i].V for i in ids)
+                if more > 4 * have and more > 200 and not _reaches_firepoint(model, geoms, ids, n, fp_hash):
+                    sel[n] = sel[n] + [i for i in ids if i not in sel[n]]
+                break
+    return sel
+
+
+def _reaches_firepoint(model, geoms, ids, node, fp_hash, margin=0.05):
+    """Whether a firepoint at or under ``node`` lies inside the bounding box of meshes ``ids``
+    (grown by ``margin`` m). A box, not the nearest vertex: the Fennek's LOD 1 housing is hollow
+    around the barrel (0.2 m from the firepoint) but runs to it."""
+    W = _node_worlds(model)
+    under, todo = [], [node]
+    while todo:
+        i = todo.pop()
+        under.append(i)
+        todo += [c.index for c in model.nodes if c.parent == i]
+    fps = [W[i][:3, 3] for i in under if model.nodes[i].name == fp_hash]
+    if not fps:
+        return False
+    P = np.concatenate([geoms[i].positions for i in ids]).astype(np.float64)  # node space
+    inv = np.linalg.inv(W[node])
+    lo, hi = P.min(0) - margin, P.max(0) + margin
+    return any(np.all((q >= lo) & (q <= hi)) for q in (inv[:3, :3] @ f + inv[:3, 3] for f in fps))
 
 
 def _extra_lods(model, geoms, keep, lod):
@@ -209,8 +296,22 @@ def _preview_image(col):
 # Bump when the material build changes: a .blend's materials built by an older importer are then
 # rebuilt instead of reused.
 IMAGE_SLOTS = (3, 4, 5, 15, 16, 17, 255)  # binding slots _build loads images for
-MATERIAL_VERSION = 4  # 3: normal maps through the shared MAG Normal group; 4: base layer = lowest
-#                       binding offset, colour images Channel Packed unless alpha is opacity, wire colour
+MATERIAL_VERSION = 7  # 3: normal maps through the shared MAG Normal group; 4: base layer = lowest
+#                       binding offset, colour images Channel Packed unless alpha is opacity, wire colour;
+#                       5: soft alpha (Blended, Channel Packed) for alpha refs <= SOFT_ALPHA_REF,
+#                       translucent colour Channel Packed, transparent shadows;
+#                       6: no build change: rebuilds materials tagged 5 by unfinished soft-decal
+#                       code (black chimney streaks, black-boxed posters in saved scenes)
+#                       7: DXT1 ref-1 materials are hard cut-outs, not Blended (Kennicott walls
+#                       drew see-through); lopsided detail scales made uniform (MRAV streaks);
+#                       water normals DXT5nm in world space
+# Alpha-test references up to this value (of 255) only discard empty texels: the materials (107 of
+# them with ref 1, e.g. Baku's rust streaks f2ed7634 and posters 27799487) are soft-alpha decals
+# that the game blends, so their alpha also drives the opacity.
+SOFT_ALPHA_REF = 10
+# Normal Map strength of water ripples (two layers of a steep ripple map summed; a guess that keeps
+# puddles calm instead of the swirling "oil" a full-strength map gives)
+WATER_NORMAL_STRENGTH = 0.3
 
 
 class MaterialCache:
@@ -259,10 +360,12 @@ class MaterialCache:
 
     def image(self, h, near, non_color=False, opacity=False):
         """-> (bpy Image or None, metadata dict). Colour, colour-with-opacity and data uses get
-        separate datablocks. Only ``opacity`` images (a base map whose alpha the material tests
-        or blends with) keep Straight alpha; the others are Channel Packed, because Blender
-        premultiplies straight images and so loses the colour wherever alpha is 0 (backdrop
-        rocks, roads and specular maps use alpha for something else and drew black)."""
+        separate datablocks. Only ``opacity`` images (the base map of a hard alpha test or a
+        translucent material) keep Straight alpha, which Workbench needs to show cut-outs. The
+        others are Channel Packed: Blender stores Straight 8-bit images premultiplied, which
+        loses the colour where alpha is 0 (backdrop rocks, roads and specular maps use alpha for
+        something else and drew black) and nearly so where it is low (soft decals, whose alpha
+        the material wires itself, drew black edges)."""
         key = (h, non_color, opacity)
         if key in self.images:
             return self.images[key]
@@ -341,7 +444,13 @@ class MaterialCache:
             mat['mag_uv_transform'] = list(uvt)
         if 3 in b:
             has_alpha = bool(self.lib.texture_file(b[3], mzrb)[1].get('alpha'))
-            opacity = info.alpha_test or ((info.translucent or not info.parsed) and has_alpha)
+            # DXT1 alpha is 1-bit, so a low reference on it is an exact cut-out, not a soft
+            # decal: Blended walls (Kennicott's b836f2e6) let EEVEE show the far side through them
+            fmt = self.lib.texture_file(b[3], mzrb)[1].get('fmt')
+            soft = info.alpha_test and info.alpha_ref <= SOFT_ALPHA_REF and fmt != 'DXT1'
+            # Straight alpha only for hard cut-outs; soft and translucent alpha must keep the
+            # colour of its faint texels
+            opacity = (info.alpha_test and not soft) or (not info.parsed and has_alpha)
             img, meta = self.image(b[3], mzrb, opacity=opacity)
             if img:
                 n = nt.nodes.new('ShaderNodeTexImage')
@@ -357,12 +466,26 @@ class MaterialCache:
                     cut.operation, cut.location, cut.label = 'GREATER_THAN', (-200, y - 200), 'Alpha test'
                     links.new(n.outputs['Alpha'], cut.inputs[0])
                     cut.inputs[1].default_value = (ref - 0.5) / 255.0
-                    links.new(cut.outputs[0], bsdf.inputs['Alpha'])
-                    mat.surface_render_method = 'DITHERED'
+                    alpha = cut.outputs[0]
+                    if soft:
+                        # a reference this low only drops empty texels of a soft-alpha decal
+                        # (rust streaks, posters): the rest is blended by its alpha
+                        soft = nt.nodes.new('ShaderNodeMath')
+                        soft.operation, soft.location, soft.label = 'MULTIPLY', (-50, y - 200), 'Soft alpha'
+                        links.new(cut.outputs[0], soft.inputs[0])
+                        links.new(n.outputs['Alpha'], soft.inputs[1])
+                        alpha = soft.outputs[0]
+                        mat['mag_soft_alpha'] = True
+                    links.new(alpha, bsdf.inputs['Alpha'])
+                    # soft decals are Blended: EEVEE draws a Dithered shell lying on its surface
+                    # black where the two meet (Baku chimneys); Cycles is fine either way
+                    mat.surface_render_method = 'BLENDED' if soft else 'DITHERED'
+                    mat.use_transparent_shadow = True  # shadows keep the alpha test's holes
                     mat['mag_alpha_ref'] = ref
                 elif info.translucent and meta.get('alpha'):
                     links.new(n.outputs['Alpha'], bsdf.inputs['Alpha'])
                     mat.surface_render_method = 'BLENDED'
+                    mat.use_transparent_shadow = True
                 color = self._detail_color(mat, info, mzrb, color, y)
                 links.new(color, bsdf.inputs['Base Color'])
                 base_node = n
@@ -387,12 +510,21 @@ class MaterialCache:
                 links.new(inv.outputs[0], bsdf.inputs['Roughness'])
             y -= 300
         normals = []  # (x, y) sockets in -1..1, summed (the detail normal adds to the base one)
+        water_tiles = info.water_tiles() if info.water else None
         if 4 in b:
             img, meta = self.image(b[4], mzrb, non_color=True)
-            if img:
+            if img and water_tiles:
+                # the shared ripple map is DXT5nm (X in alpha, Y in green; red holds something
+                # else, which fools the format guess), tiled twice in world space
+                for k, tile in enumerate(water_tiles):
+                    vec = self._world_uv(nt, tile, 'Water ripples %d' % (k + 1), y)
+                    normals.append(self._normal_xy(nt, img, True, 'Water ripples %d' % (k + 1), vec, y))
+                    y -= 400
+                mat['mag_water_tiles'] = list(water_tiles)
+            elif img:
                 normals.append(self._normal_xy(nt, img, meta.get('dxt5nm', True), 'Normal', base_uv, y))
             y -= 400
-        detail_normal = 16 in b and info.detail_scale(16)
+        detail_normal = 16 in b and info.detail_scale(16) and not water_tiles
         if detail_normal:
             img, meta = self.image(b[16], mzrb, non_color=True)
             if img:
@@ -401,7 +533,9 @@ class MaterialCache:
                 mat['mag_detail_normal'] = list(info.detail_scale(16))
             y -= 400
         if normals:
-            self._normal_out(nt, bsdf, normals, y)
+            nmap = self._normal_out(nt, bsdf, normals, y)
+            if water_tiles:
+                nmap.inputs['Strength'].default_value = WATER_NORMAL_STRENGTH
         for slot, label in ((15, 'Emissive/Mask'), (16, 'Detail Normal'), (17, 'Detail Color'), (255, 'Mask')):
             if slot in b and not (slot == 16 and detail_normal) and not (slot == 17 and 'mag_detail_color' in mat):
                 img, _ = self.image(b[slot], mzrb, non_color=slot != 17)
@@ -417,6 +551,7 @@ class MaterialCache:
             bsdf.inputs['Roughness'].default_value = 0.05
             bsdf.inputs['Alpha'].default_value = 0.2
             mat.surface_render_method = 'BLENDED'
+            mat.use_transparent_shadow = True
             mat.diffuse_color = (0.6, 0.7, 0.8, 0.3)
             mat['mag_glass'] = True
         elif info.water or (not info.parsed and 3 not in b and 4 in b):
@@ -532,6 +667,17 @@ class MaterialCache:
         nm.uv_map = 'UVMap'
         links.new(grp.outputs['Normal'], nm.inputs['Color'])
         links.new(nm.outputs[0], bsdf.inputs['Normal'])
+        return nm
+
+    def _world_uv(self, nt, tile, label, y):
+        """World-space X/Y (the game's horizontal plane) divided by a tile size in metres."""
+        geo = nt.nodes.new('ShaderNodeNewGeometry')
+        geo.location = (-1700, y)
+        mp = nt.nodes.new('ShaderNodeMapping')
+        mp.location, mp.label = (-1500, y), '%s (%g m tiles)' % (label, tile)
+        mp.inputs['Scale'].default_value = (1.0 / tile, 1.0 / tile, 1.0)
+        nt.links.new(geo.outputs['Position'], mp.inputs['Vector'])
+        return mp.outputs['Vector']
 
     def _detail_uv(self, nt, scale, label, y):
         """UV0 scaled by a detail map's scale (the same V flip as the material UV transform)."""
@@ -876,22 +1022,26 @@ def _lod_name(name, k):
     return '%s_LOD%d' % (_safe(name, 54), k)
 
 
-def build_model_objects(lib, zi, ri, label, opts, mcache, collection, lower_lods=False):
+def build_model_objects(lib, zi, ri, label, opts, mcache, collection, lower_lods=False, prune=True):
     """Create objects for a (non-skinned or skinned-as-static) model. Returns the root object.
+    Every node object carries its node name hash in ``mag_node``; ``prune=False`` keeps the empty
+    helper nodes (sockets) for the caller, who then calls ``prune_helpers``.
 
     ``lower_lods``: also build the coarser LODs, in one hidden ``<collection>_LOD<n>`` child
     collection each, parented to their node's object."""
     model, geoms = lib.model(zi, ri)
-    keep = _select_meshes(model, geoms, opts.lod)
-    extra = _extra_lods(model, geoms, keep, opts.lod) if lower_lods else []
+    lod = _effective_lod(model, geoms, opts.lod)
+    sel = _node_selection(model, geoms, lod)
+    keep = set().union(*sel.values())
+    extra = [(k, _node_selection(model, geoms, k)) for k, _ in _extra_lods(model, geoms, keep, lod)] if lower_lods else []
     lod_colls = _LodCollections(collection) if extra else None
     objs = {}
     root = None
     single = len(model.nodes) == 1
     for node in model.nodes:
-        span = range(node.mesh_start, node.mesh_start + node.mesh_count)
-        mesh_ids = [i for i in span if i in keep]
-        name = label if single else '%s.%s' % (label, lib.index.label(node.name, 'node%d' % node.index))
+        mesh_ids = sel[node.index]
+        node_name = lib.index.label(node.name, loadout.NODE_NAMES.get(node.name) or 'node%d' % node.index)
+        name = label if single else '%s.%s' % (label, node_name)
         if mesh_ids:
             parts, mats = _mesh_parts(model, geoms, mesh_ids, mcache, zi)
             me = make_mesh(_safe(name), parts, mats)
@@ -909,13 +1059,14 @@ def build_model_objects(lib, zi, ri, label, opts, mcache, collection, lower_lods
         ob.matrix_parent_inverse = Matrix.Identity(4)
         ob.matrix_basis = Matrix(to_blender_matrix(L).tolist())
         collection.objects.link(ob)
+        ob['mag_node'] = '%08x' % node.name
         objs[node.index] = ob
         if node.parent >= 0 and node.parent in objs:
             ob.parent = objs[node.parent]
         elif root is None:
             root = ob
-        for k, ids in extra:
-            lod_ids = [i for i in span if i in ids]
+        for k, ksel in extra:
+            lod_ids = ksel[node.index]
             if not lod_ids or lod_ids == mesh_ids:
                 continue
             parts, mats = _mesh_parts(model, geoms, lod_ids, mcache, zi)
@@ -924,15 +1075,20 @@ def build_model_objects(lib, zi, ri, label, opts, mcache, collection, lower_lods
             lob.parent = ob
             lob.matrix_parent_inverse = Matrix.Identity(4)
             lod_colls.get(k).objects.link(lob)
-    # prune empty leaf nodes (attachment helpers) to keep the outliner tidy
-    for idx in sorted(objs, reverse=True):
-        ob = objs[idx]
-        if ob.type == 'EMPTY' and not ob.children and ob is not root:
-            bpy.data.objects.remove(ob)
     if root is None:
         root = next(iter(objs.values()))
     root['mag_model'] = '%08x' % model.name
+    if prune:
+        prune_helpers(root)
     return root
+
+
+def prune_helpers(root):
+    """Delete empty leaf nodes (attachment helpers and sockets nothing is mounted on), deepest
+    first, to keep the outliner tidy."""
+    for ob in reversed([root] + list(root.children_recursive)):
+        if ob.type == 'EMPTY' and not ob.children and ob is not root:
+            bpy.data.objects.remove(ob)
 
 
 # -- armatures --------------------------------------------------------------------------------------
@@ -1019,7 +1175,12 @@ def _skin(ob, parts, arm_ob):
 
 
 def build_skinned(lib, zi, ri, label, opts, mcache, collection, lower_lods=False):
+    """A skinned model on its armature (reused when the active object is a matching rig). A
+    third-person body (skeleton ``root_main``) also gets the head collection (``build_heads``);
+    the head record itself imports as that collection on its own rig."""
     model, geoms = lib.model(zi, ri)
+    if model.type == T_HEAD_MODEL:
+        return _build_head_record(lib, zi, ri, model, geoms, label, opts, mcache, collection)
     keep = _select_meshes(model, geoms, opts.lod)
     parts, mats = _mesh_parts(model, geoms, sorted(keep), mcache, zi)
     me = make_mesh(_safe(label), parts, mats)
@@ -1044,7 +1205,201 @@ def build_skinned(lib, zi, ri, label, opts, mcache, collection, lower_lods=False
         lob['mag_lod'] = k
         lod_colls.get(k).objects.link(lob)
         _skin(lob, lparts, arm_ob)
+    if skel.name == HEAD_SKELETON:
+        build_heads(lib, opts, mcache, collection, arm_ob, label)
     return arm_ob
+
+
+# -- heads --------------------------------------------------------------------------------------------
+HEAD_SKELETON = 'root_main'   # third-person characters; heads are skinned to the same bones
+DEFAULT_HEAD = 0
+SKIN_TONES = {0: 'tone0', 1: 'tone1', 2: 'tone2'}  # CharacterHeadData.skin_tone (names unknown)
+
+
+def head_record(lib):
+    """(zi, ri) of the head model named by the CharacterHeadDataTable, or None."""
+    info = lib.index.loadout.get('heads')
+    if not info:
+        return None
+    hit = lib.index.find(info['model'], (T_HEAD_MODEL,))
+    return (hit[1], hit[2]) if hit else None
+
+
+def _show(ob, visible):
+    ob.hide_render = not visible
+    try:
+        ob.hide_set(not visible)
+    except RuntimeError:  # not in the view layer (excluded collection)
+        pass
+
+
+def _head_objects(lib, zi, ri, model, geoms, opts, mcache, coll, arm_ob, default):
+    """One object per head variant (mesh flags = head index), skinned to arm_ob; only ``default``
+    is shown. Returns the objects."""
+    lod = _effective_lod(model, geoms, opts.lod)
+    groups = collections.defaultdict(list)
+    for i, me in enumerate(model.meshes):
+        if geoms[i] is not None and _in_lod(me, lod):
+            groups[me.flags].append(i)
+    tones = (lib.index.loadout.get('heads') or {}).get('tones') or []
+    out = []
+    for k in sorted(groups):
+        parts, mats = _mesh_parts(model, geoms, groups[k], mcache, zi)
+        tone = tones[k] if k < len(tones) else None
+        nm = 'Head_%02d' % k + ('_%s' % SKIN_TONES.get(tone, 'tone%s' % tone) if tone is not None else '')
+        ob = bpy.data.objects.new(nm, make_mesh(nm, parts, mats))
+        coll.objects.link(ob)
+        _skin(ob, parts, arm_ob)
+        ob['mag_head'] = k
+        ob['mag_model'] = '%08x' % model.name
+        _show(ob, k == default)
+        out.append(ob)
+    return out
+
+
+def build_heads(lib, opts, mcache, collection, arm_ob, label, default=DEFAULT_HEAD):
+    """Every head variant in a ``<label> Heads`` child collection, skinned to the body's rig, with
+    head ``default`` shown and the rest hidden (toggle them in the Outliner)."""
+    hit = head_record(lib)
+    if hit is None:
+        return None
+    zi, ri = hit
+    model, geoms = lib.model(zi, ri)
+    coll = bpy.data.collections.new('%s Heads' % _safe(label, 50))
+    collection.children.link(coll)
+    _head_objects(lib, zi, ri, model, geoms, opts, mcache, coll, arm_ob, default)
+    return coll
+
+
+def _build_head_record(lib, zi, ri, model, geoms, label, opts, mcache, collection):
+    lod = _effective_lod(model, geoms, opts.lod)
+    first = [geoms[i] for i, me in enumerate(model.meshes) if geoms[i] is not None and _in_lod(me, lod)
+             and me.flags == DEFAULT_HEAD]
+    skel = lib.skeleton(HEAD_SKELETON) if opts.skeleton == 'AUTO' else choose_skeleton(lib, first, opts.skeleton)
+    if skel is None:
+        skel = choose_skeleton(lib, first, 'AUTO')
+    arm_ob = None
+    act = bpy.context.view_layer.objects.active
+    if act is not None and act.type == 'ARMATURE' and skel is not None and act.get('mag_skeleton') == skel.name:
+        arm_ob = act
+    if arm_ob is None:
+        arm_ob = build_armature(skel, collection, '%s_rig' % _safe(label, 50))
+    _head_objects(lib, zi, ri, model, geoms, opts, mcache, collection, arm_ob, DEFAULT_HEAD)
+    return arm_ob
+
+
+# -- weapon attachments -----------------------------------------------------------------------------
+def build_weapon_attachments(lib, root, label, opts, mcache, collection):
+    """Mount a weapon's attachments on its socket nodes (``core/loadout.py``). The required sight
+    (the rear iron sight on the M4) is shown like the rest of the weapon; the other compatible
+    attachments go to a ``<label> Attachments`` child collection, hidden. Returns the number
+    mounted. Call before ``prune_helpers`` (the sockets are empty helper nodes)."""
+    lo = lib.index.loadout
+    wid, first_person = loadout.weapon_for_model(lo, int(root.get('mag_model', '0'), 16))
+    if wid is None:
+        return 0
+    sockets = {}
+    for ob in [root] + list(root.children_recursive):
+        if ob.get('mag_node'):
+            sockets.setdefault(ob['mag_node'], ob)
+    extra_coll = None
+    n = 0
+    for aid, atype, sock, mh, required in loadout.weapon_attachments(lo, wid, first_person):
+        target = sockets.get('%08x' % loadout.token(sock))
+        hit = lib.index.find(mh, (T_MODEL,))
+        if target is None or hit is None:
+            continue
+        if required:
+            dest = collection
+        else:
+            if extra_coll is None:
+                extra_coll = bpy.data.collections.new('%s Attachments' % _safe(label, 48))
+                collection.children.link(extra_coll)
+            dest = extra_coll
+        aroot = build_model_objects(lib, hit[1], hit[2], aid, opts, mcache, dest)
+        aroot.parent = target
+        aroot.matrix_parent_inverse = Matrix.Identity(4)
+        aroot.matrix_basis = Matrix.Identity(4)
+        aroot['mag_attachment'] = aid
+        aroot['mag_attachment_type'] = loadout.ATTACHMENT_TYPES.get(atype, str(atype))
+        if not required:
+            for ob in [aroot] + list(aroot.children_recursive):
+                _show(ob, False)
+        n += 1
+    return n
+
+
+GUN_REACH = 0.12  # m: turret meshes this close to a firepoint mean the gun is part of the vehicle
+
+
+def build_vehicle_weapons(lib, root, opts, mcache, collection):
+    """Mount the weapon models of a vehicle's turrets (``loadout.vehicle_weapons``) on the
+    ``turret_pitch`` node under each seat's turret node (``turret_01``, ``turret_02``). A seat
+    without a node of its own (deployable turrets) uses the model's only ``turret_pitch``. A
+    turret whose own meshes already reach its firepoint has the gun built in (NH90, Hind) and
+    gets nothing. Returns the number mounted. Call before ``prune_helpers``."""
+    lo = lib.index.loadout
+    mounts = loadout.vehicle_weapons(lo, int(root.get('mag_model', '0'), 16))
+    if not mounts:
+        return 0
+    obs = [root] + list(root.children_recursive)
+    pitch = '%08x' % loadout.token('turret_pitch')
+
+    def first_pitch(ob):
+        todo = [ob]
+        while todo:
+            o = todo.pop(0)
+            if o.get('mag_node') == pitch:
+                return o
+            todo += sorted(o.children, key=lambda c: c.name)
+        return None
+
+    firepoint = '%08x' % loadout.token('firepoint')
+
+    def gun_modelled(t):
+        """The turret already carries its gun: its meshes reach a firepoint under it (NH90 door
+        guns within 0.08 m; the Fennek's empty cradle stops 0.2 m short)."""
+        sub = [t] + list(t.children_recursive)
+        fps = [o.matrix_world.translation for o in sub if o.get('mag_node') == firepoint]
+        if not fps:
+            return False
+        for o in sub:
+            if o.type != 'MESH' or not len(o.data.vertices):
+                continue
+            co = np.empty(len(o.data.vertices) * 3, np.float32)
+            o.data.vertices.foreach_get('co', co)
+            M = np.array(o.matrix_world)
+            P = co.reshape(-1, 3) @ M[:3, :3].T + M[:3, 3]
+            if any(np.linalg.norm(P - np.array(f), axis=1).min() < GUN_REACH for f in fps):
+                return True
+        return False
+
+    bpy.context.view_layer.update()
+    pitches = [o for o in obs if o.get('mag_node') == pitch]
+    used = set()
+    n = 0
+    for seat, models in mounts:
+        seat_ob = next((o for o in obs if seat and o.get('mag_node') == '%08x' % seat), None)
+        target = first_pitch(seat_ob) if seat_ob is not None else (pitches[0] if len(pitches) == 1 else None)
+        if target is None:
+            target = seat_ob
+        if target is None or target.name in used:
+            continue
+        used.add(target.name)
+        if gun_modelled(target):
+            continue
+        for mh in models:
+            hit = lib.index.find(mh, (T_MODEL,))
+            if hit is None:
+                continue
+            wid, _ = loadout.weapon_for_model(lo, mh)
+            wroot = build_model_objects(lib, hit[1], hit[2], wid or lib.index.label(mh), opts, mcache, collection)
+            wroot.parent = target
+            wroot.matrix_parent_inverse = Matrix.Identity(4)
+            wroot.matrix_basis = Matrix.Identity(4)
+            wroot['mag_vehicle_weapon'] = wid or ''
+            n += 1
+    return n
 
 
 # -- animation ---------------------------------------------------------------------------------------
@@ -1079,6 +1434,7 @@ def build_action(anim, skel, arm_ob, scene):
     nm = re.split(r'[\\/]', anim.name)[-1].rsplit('.', 1)[0] if anim.name else 'mag_anim'
     action = bpy.data.actions.new(_safe(nm))
     action['mag_skeleton'] = skel.name
+    action['mag_additive'] = bool(anim.additive)
     ad = arm_ob.animation_data or arm_ob.animation_data_create()
     ad.action = action
     fps = scene.render.fps / scene.render.fps_base
@@ -1101,9 +1457,16 @@ def build_action(anim, skel, arm_ob, scene):
         sa = anim.scales[ti].astype(np.float64)
         # basis in game space: inv(rest_local) @ anim_local
         qi = _qconj(rest_q[b])[None, :]
-        qb = _qmul(np.broadcast_to(qi, qa.shape), qa)
-        tb = _qrot(np.broadcast_to(qi, (len(ta), 4)), ta - rest_t[b][None, :])
-        sb = sa / np.where(np.abs(rest_s[b]) > 1e-8, rest_s[b], 1.0)[None, :]
+        if anim.additive:
+            # deltas (rotation base*delta, translation base+delta, scale base*delta): on the
+            # rest pose the basis is the delta itself, translation turned into the bone frame
+            qb = qa
+            tb = _qrot(np.broadcast_to(qi, (len(ta), 4)), ta)
+            sb = sa
+        else:
+            qb = _qmul(np.broadcast_to(qi, qa.shape), qa)
+            tb = _qrot(np.broadcast_to(qi, (len(ta), 4)), ta - rest_t[b][None, :])
+            sb = sa / np.where(np.abs(rest_s[b]) > 1e-8, rest_s[b], 1.0)[None, :]
         # bone matrices are C @ M @ C^T (see build_armature), so the basis is conjugated too:
         # vector parts go through the same (x, y, z) -> (x, -z, y) map
         qb = np.concatenate([to_blender_vec(qb[:, :3]), qb[:, 3:]], 1)
@@ -1134,6 +1497,128 @@ def build_action(anim, skel, arm_ob, scene):
     action.frame_start = 1
     action.frame_end = max(1.0, float(frames[-1]))
     return action
+
+
+BASE_TRACK = 'MAG base'
+
+
+def show_action(arm_ob, action, previous=None):
+    """Make ``action`` the rig's playing clip. A normal clip replaces the pose (and drops the
+    ``MAG base`` NLA track). An additive clip is a delta, so it plays with Combine blending on top
+    of a base: ``previous`` when that is a normal MAG clip (moved to the ``MAG base`` track), else
+    the existing base track, else the bind pose. Returns the base action or None."""
+    ad = arm_ob.animation_data or arm_ob.animation_data_create()
+    track = ad.nla_tracks.get(BASE_TRACK)
+    if not action.get('mag_additive'):
+        if track is not None:
+            ad.nla_tracks.remove(track)
+        ad.action = action
+        ad.action_blend_type = 'REPLACE'
+        return None
+    base = None
+    if previous is not None and previous is not action and not previous.get('mag_additive'):
+        base = previous
+        if track is not None:
+            ad.nla_tracks.remove(track)
+        prev_slot = ad.action_slot if ad.action is previous else None
+        ad.action = None  # a strip cannot be added for the action being edited
+        track = ad.nla_tracks.new()
+        track.name = BASE_TRACK
+        strip = track.strips.new(_safe(base.name, 50), 1, base)
+        if prev_slot is not None and getattr(strip, 'action_slot', None) is None:
+            strip.action_slot = prev_slot
+        strip.extrapolation = 'HOLD'
+        # loop the base under the whole additive clip
+        span = max(1.0, base.frame_range[1] - base.frame_range[0])
+        need = action.frame_range[1] - 1
+        if need > span:
+            strip.repeat = float(np.ceil(need / span))
+    elif track is not None and len(track.strips):
+        base = track.strips[0].action
+    ad.action = action
+    ad.action_blend_type = 'COMBINE'
+    return base
+
+
+# Clip shown first on a fresh rig, per skeleton (the first one on the disc wins); other skeletons
+# take their first clip with 'idle' in its name, else their first clip
+IDLE_CLIPS = {'root_main': ('stand_p_idle', 'stand_idle', 'stand_p_aim_idle'),
+              'root_arms': ('fps_idle', 'fps_p_idle', 'fps_ironsights_idle')}
+
+
+def skeleton_clips(lib, skel_name):
+    """Animation assets (index entries) bound to the skeleton, in index order."""
+    idx = lib.index
+    out = []
+    for a in idx.assets:
+        if a.category != 'ANIMATION':
+            continue
+        s = idx.havok.get((a.zrb, a.rec))
+        k = a.extra or 0
+        if s and k < len(s['animations']) and s['animations'][k][0] == skel_name and s['animations'][k][1] > 1:
+            out.append(a)
+    return out
+
+
+def _idle_clip(clips, skel_name):
+    by_label = {a.label: a for a in clips}
+    for nm in IDLE_CLIPS.get(skel_name, ()):
+        if nm in by_label:
+            return by_label[nm]
+    return next((a for a in clips if 'idle' in a.label.lower()), clips[0] if clips else None)
+
+
+def build_skeleton_animations(lib, arm_ob, skel, opts, scene):
+    """The ``opts.animations`` clips of the rig's skeleton as actions: 'IDLE' one idle clip,
+    'ALL' every clip (names containing ``opts.anim_filter``, when set). Every action keeps a fake
+    user, so the ones not assigned survive saving; the idle clip (or the first) is assigned and
+    sets the scene frame range. Returns (number of actions, assigned action or None)."""
+    mode = getattr(opts, 'animations', 'NONE')
+    if mode == 'NONE' or skel is None:
+        return 0, None
+    clips = skeleton_clips(lib, skel.name)
+    if not clips:
+        return 0, None
+    idle = _idle_clip(clips, skel.name)
+    if mode == 'ALL':
+        needle = (getattr(opts, 'anim_filter', '') or '').strip().lower()
+        chosen = [a for a in clips if needle in a.label.lower()] if needle else clips
+    else:
+        chosen = [idle]
+    if not chosen:
+        return 0, None
+    if opts.set_fps:
+        scene.render.fps = 30
+        scene.render.fps_base = 1.0
+    # one decode per packfile (most hold one clip; a few hold several)
+    by_pf = collections.OrderedDict()
+    for a in chosen:
+        by_pf.setdefault((a.zrb, a.rec), []).append(a)
+    first = assigned = None
+    n = 0
+    for (zi, ri), entries in by_pf.items():
+        try:
+            anims = lib.animations(zi, ri)
+        except Exception as e:  # one bad packfile must not stop the rest
+            print('MAG: animation %s not decodable: %s' % (entries[0].label, e))
+            continue
+        for a in entries:
+            k = a.extra or 0
+            if k >= len(anims):
+                continue
+            act = build_action(anims[k], skel, arm_ob, scene)
+            act.name = _safe(a.label)
+            act.use_fake_user = True
+            n += 1
+            first = first or act
+            if a is idle:
+                assigned = act
+    assigned = assigned or first
+    if assigned is not None:
+        show_action(arm_ob, assigned)
+        scene.frame_start = 1
+        scene.frame_end = int(assigned.frame_end)
+    return n, assigned
 
 
 # -- maps ----------------------------------------------------------------------------------------------

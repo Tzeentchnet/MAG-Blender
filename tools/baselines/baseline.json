@@ -1,5 +1,5 @@
 {
- "index_version": 14,
+ "index_version": 16,
  "levels": {
   "mag_alaska_subpen_final": {
    "backdrop": 11,
@@ -87213,6 +87213,16 @@
     "4f8a2671": "997f07e20b4e28f4",
     "b358173d": "9678570b077fc8d2",
     "f4f86ded": "31b38a9d42a4608e"
+   }
+  },
+  "MAIN.PSARC:/run/mag/ps3/global_resources/character_class.zrb": {
+   "digest": "6f0ffa440f9d12bd",
+   "mesh_fails": 0,
+   "meshes": 45,
+   "models": 1,
+   "parse_fails": 0,
+   "per_model": {
+    "6fcc518f": "e438300b8761b650"
    }
   },
   "MAIN.PSARC:/run/mag/ps3/global_resources/data_scripts_factiontypeall.zrb": {

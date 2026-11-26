@@ -132,6 +132,19 @@ class MAG_SceneProps(bpy.types.PropertyGroup):
                            description='Skeleton used for skinned characters')
     set_fps: BoolProperty(name='Set Scene to 30 fps', default=True,
                           description='MAG animations are authored at 30 frames per second')
+    animations: EnumProperty(
+        name='Animations', default='NONE',
+        items=(('NONE', 'None', 'Import the character in its bind pose only'),
+               ('IDLE', 'Idle', "Add the skeleton's idle clip as an action (stand_p_idle for "
+                'third-person bodies, fps_idle for first-person arms)'),
+               ('ALL', 'All', "Add every clip of the character's skeleton as an action (461 for "
+                'third-person bodies, 208 for first-person arms; use the filter to pick some). '
+                'The idle clip is assigned, the others keep a fake user: switch them in the '
+                'Action Editor')),
+        description='Animations to add to imported characters (skinned models)')
+    anim_filter: StringProperty(name='Filter', default='',
+                                description="With All: only clips whose name contains this text "
+                                            "(e.g. 'reload', 'stand_p_'). Empty = every clip")
     include_terrain: BoolProperty(name='Terrain', default=True,
                                   description='Import the map terrain (finest level of its LOD tree)')
     terrain_detail: EnumProperty(
@@ -321,7 +334,8 @@ def _options(context):
                                terrain_lod=sp.terrain_lod, terrain_fade=sp.terrain_fade,
                                foliage_fade=sp.foliage_fade, sky=sp.sky, sky_strength=sp.sky_strength,
                                collision=ip.import_collision, baked_lighting=ip.import_lightmaps,
-                               lower_lods=ip.import_lower_lods, pack_textures=ip.pack_textures)
+                               lower_lods=ip.import_lower_lods, pack_textures=ip.pack_textures,
+                               animations=sp.animations, anim_filter=sp.anim_filter)
 
 
 def _target_collection(context, name):
@@ -383,18 +397,32 @@ class MAG_OT_import(bpy.types.Operator):
             else:
                 rt = S.index.zrbs[asset.zrb].records[asset.rec][7]
                 coll = _target_collection(context, build._safe(asset.label))
-                if rt == build.T_SKINNED_MODEL:
+                msg = 'Imported %s' % asset.label
+                if rt in (build.T_SKINNED_MODEL, build.T_HEAD_MODEL):
                     root = build.build_skinned(lib, asset.zrb, asset.rec, asset.label, opts, mcache, coll,
                                                lower_lods=opts.lower_lods)
+                    if root.type == 'ARMATURE' and opts.animations != 'NONE':
+                        skel = lib.skeleton(root.get('mag_skeleton', ''))
+                        na, act = build.build_skeleton_animations(lib, root, skel, opts, context.scene)
+                        if na:
+                            msg += ' with %d animation%s (%s assigned)' % (na, 's' if na > 1 else '', act.name)
+                        else:
+                            msg += ' (no animations match)'
                 else:
                     root = build.build_model_objects(lib, asset.zrb, asset.rec, asset.label, opts, mcache, coll,
-                                                     lower_lods=opts.lower_lods)
+                                                     lower_lods=opts.lower_lods, prune=False)
+                    n = build.build_weapon_attachments(lib, root, asset.label, opts, mcache, coll)
+                    nv = build.build_vehicle_weapons(lib, root, opts, mcache, coll)
+                    build.prune_helpers(root)
+                    if n:
+                        msg += ' with %d attachment%s (optional ones hidden)' % (n, 's' if n > 1 else '')
+                    if nv:
+                        msg += ' with %d turret weapon%s' % (nv, 's' if nv > 1 else '')
                 root.location = context.scene.cursor.location
                 for ob in context.selected_objects:
                     ob.select_set(False)
                 root.select_set(True)
                 context.view_layer.objects.active = root
-                msg = 'Imported %s' % asset.label
         except Exception as e:
             traceback.print_exc()
             self.report({'ERROR'}, 'Import failed: %s' % e)
@@ -420,11 +448,16 @@ class MAG_OT_import(bpy.types.Operator):
         if opts.set_fps:
             context.scene.render.fps = 30
             context.scene.render.fps_base = 1.0
+        prev = arm.animation_data.action if arm.animation_data else None
         act = build.build_action(an, skel, arm, context.scene)
+        base = build.show_action(arm, act, prev)
         context.scene.frame_start = 1
         context.scene.frame_end = int(act.frame_end)
         context.view_layer.objects.active = arm
-        return 'Animation %s on %s (%d frames)' % (act.name, arm.name, an.num_frames)
+        msg = 'Animation %s on %s (%d frames)' % (act.name, arm.name, an.num_frames)
+        if an.additive:
+            msg += ', additive over %s' % (base.name if base else 'the bind pose')
+        return msg
 
 
 # -- UI --------------------------------------------------------------------------------------------------
@@ -507,6 +540,10 @@ class MAG_PT_options(bpy.types.Panel):
         col.prop(sp, 'materials')
         col.prop(sp, 'flip_green')
         col.prop(sp, 'skeleton')
+        col.prop(sp, 'animations')
+        sub = col.column()
+        sub.active = sp.animations == 'ALL'
+        sub.prop(sp, 'anim_filter')
         col.prop(sp, 'set_fps')
         col.prop(sp, 'include_terrain')
         sub = col.column()
