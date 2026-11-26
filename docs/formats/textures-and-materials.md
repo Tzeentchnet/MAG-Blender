@@ -232,6 +232,12 @@ The largest groups and the special ones:
   Blender's flipped V). This affects 39 materials on the disc.
 * **Detail normal (16).** Sampled at `uv0 · d` and added to the base normal's X and Y (UDN
   blending) before the Normal Map node.
+* **Normal decoding** happens in one shared node group, *MAG Normal* (*MAG Normal (flip G)* with
+  Flip Normal Green): it takes the base and the detail map's colour and alpha, a *DXT5nm* flag for
+  each (X from alpha, else from red), and *Detail* (0/1). It sums the X/Y, rebuilds Z from the
+  base map, and outputs the colour for the material's Normal Map node. Before `MATERIAL_VERSION`
+  3, each material built these ~20 maths nodes itself, which made material building about twice
+  as slow.
 * **Detail colour (17).** Sampled at `uv0 · d`. The base colour is multiplied by
   `(2 · detail)^2.2`: 2× around mid-grey (the detail textures average 0.5), with the exponent
   because the game presumably blends gamma-space values.

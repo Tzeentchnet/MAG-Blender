@@ -150,11 +150,39 @@ def _rgb565(c):
     return np.stack([r, g, b], -1).astype(np.int32)
 
 
-def decode_dxt(fmt, data, w, h):
-    """Decode DXT1/3/5 level 0 -> (h, w, 4) uint8."""
+def _dxt_blocks(fmt, data, w, h):
     bw, bh = max(1, (w + 3) // 4), max(1, (h + 3) // 4)
     bs = BLOCK[fmt]
-    blk = np.frombuffer(data, np.uint8, count=bw * bh * bs).reshape(bh * bw, bs)
+    return np.frombuffer(data, np.uint8, count=bw * bh * bs).reshape(bh * bw, bs), bw, bh
+
+
+def decode_dxt(fmt, data, w, h):
+    """Decode DXT1/3/5 level 0 -> (h, w, 4) uint8."""
+    blk, bw, bh = _dxt_blocks(fmt, data, w, h)
+    px = _decode_blocks(fmt, blk)  # (n,16,4), texel index = row * 4 + column
+    px = px.reshape(bh, bw, 4, 4, 4).transpose(0, 2, 1, 3, 4).reshape(bh * 4, bw * 4, 4)
+    return px[:h, :w]
+
+
+def sample_rgba(t, data, n=64):
+    """``decode_rgba(t, data)[::sy, ::sx]`` with sy, sx = max(1, h // n), max(1, w // n), decoding
+    only the DXT blocks that hold the sampled texels (metadata checks on large textures)."""
+    w, h = t.width, t.height
+    sy, sx = max(1, h // n), max(1, w // n)
+    if t.fmt not in FOURCC:
+        return decode_rgba(t, data)[::sy, ::sx]
+    blk, bw, bh = _dxt_blocks(t.fmt, data, w, h)
+    ys, xs = np.arange(0, h, sy), np.arange(0, w, sx)
+    bidx = (ys // 4)[:, None] * bw + (xs // 4)[None, :]
+    used, inv = np.unique(bidx.ravel(), return_inverse=True)
+    px = _decode_blocks(t.fmt, blk[used])
+    texel = ((ys % 4)[:, None] * 4 + (xs % 4)[None, :]).ravel()
+    return px[inv, texel].reshape(len(ys), len(xs), 4)
+
+
+def _decode_blocks(fmt, blk):
+    """DXT blocks (n, block bytes) -> (n, 16, 4) uint8 RGBA, texel index = row * 4 + column."""
+    bs = BLOCK[fmt]
     cb = blk[:, bs - 8:]
     c0 = cb[:, 0].astype(np.int32) | (cb[:, 1].astype(np.int32) << 8)
     c1 = cb[:, 2].astype(np.int32) | (cb[:, 3].astype(np.int32) << 8)
@@ -190,9 +218,7 @@ def decode_dxt(fmt, data, w, h):
         tab = np.where((a0 > a1)[:, None], tab8, tab6)
         # palette index order: 0->a0, 1->a1, 2..7 interpolated
         a = np.take_along_axis(tab, asel, 1)
-    px = np.concatenate([rgb, a[..., None]], -1).astype(np.uint8)  # (n,16,4)
-    px = px.reshape(bh, bw, 4, 4, 4).transpose(0, 2, 1, 3, 4).reshape(bh * 4, bw * 4, 4)
-    return px[:h, :w]
+    return np.concatenate([rgb, a[..., None]], -1).astype(np.uint8)  # (n,16,4)
 
 
 def decode_rgba(t, data):

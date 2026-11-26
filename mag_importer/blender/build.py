@@ -208,7 +208,8 @@ def _preview_image(col):
 
 # Bump when the material build changes: a .blend's materials built by an older importer are then
 # rebuilt instead of reused.
-MATERIAL_VERSION = 2
+IMAGE_SLOTS = (3, 4, 5, 15, 16, 17, 255)  # binding slots _build loads images for
+MATERIAL_VERSION = 3  # 3: normal maps through the shared MAG Normal group
 
 
 class MaterialCache:
@@ -218,11 +219,36 @@ class MaterialCache:
         self.mats = {}
         self.images = {}
         self._flags = {}
+        self._parsed = {}  # material hash -> lib.material() result
+
+    def _material(self, h, near):
+        if h not in self._parsed:
+            self._parsed[h] = self.lib.material(h, near) if self.lib else None
+        return self._parsed[h]
+
+    def prefetch(self, pairs):
+        """Convert the textures of materials ``pairs`` [(hash, near_zrb)] into the cache in
+        parallel ahead of building, instead of one by one as materials are made."""
+        if not self.lib or not self.opts.materials:
+            return 0
+        items = []
+        for h, near in dict.fromkeys(pairs):
+            out = self._material(h, near)
+            if not out:
+                continue
+            info, mzrb = out
+            if info.terrain is not None and self.opts.terrain_detail == 'FULL':
+                t = info.terrain
+                hs = [t.weights, t.macro] + list(t.colors) + list(t.normals)
+            else:
+                hs = [th for slot, th in info.bindings.items() if slot in IMAGE_SLOTS]
+            items.extend((th, mzrb) for th in hs if th)
+        return self.lib.prefetch_textures(items)
 
     def flags(self, h, near=None):
         """Flag word of a material (``MaterialInfo.flags``), None if it is not on the disc."""
         if h not in self._flags:
-            out = self.lib.material(h, near) if self.lib else None
+            out = self._material(h, near)
             self._flags[h] = out[0].flags if out else None
         return self._flags[h]
 
@@ -275,7 +301,7 @@ class MaterialCache:
         nt = mat.node_tree
         bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
         bsdf.location = (300, 300)
-        out = self.lib and self.lib.material(h, near)
+        out = self._material(h, near)
         if not out or not self.opts.materials:
             return mat
         info, mzrb = out
@@ -464,60 +490,33 @@ class MaterialCache:
         nt.nodes.active = mac
         mat['mag_layers'] = ['%08x' % h for h in t.colors]
 
-    def _math(self, nt, op, a, b=None, loc=(0, 0), c=None):
-        n = nt.nodes.new('ShaderNodeMath')
-        n.operation = op
-        n.location = loc
-        for i, v in enumerate((a, b, c)):
-            if v is None:
-                continue
-            if isinstance(v, (int, float)):
-                n.inputs[i].default_value = v
-            else:
-                nt.links.new(v, n.inputs[i])
-        return n.outputs[0]
-
     def _normal_xy(self, nt, img, dxt5nm, label, vector, y):
-        """Tangent-space X and Y (-1..1) of a normal map: DXT5nm keeps X in alpha and Y in green,
-        an RGB map X in red."""
-        links = nt.links
+        """Image node of a normal map; returns (node, dxt5nm) for _normal_out."""
         tex = nt.nodes.new('ShaderNodeTexImage')
-        tex.image, tex.location = img, (-1100, y)
+        tex.image, tex.location = img, (-500, y)
         tex.label = '%s (%s)' % (label, 'DXT5nm' if dxt5nm else 'RGB')
         if vector is not None:
-            links.new(vector, tex.inputs['Vector'])
-        sep = nt.nodes.new('ShaderNodeSeparateColor')
-        sep.location = (-800, y)
-        links.new(tex.outputs['Color'], sep.inputs[0])
-        xs = tex.outputs['Alpha'] if dxt5nm else sep.outputs['Red']
-        x = self._math(nt, 'MULTIPLY_ADD', xs, 2.0, (-650, y - 200), -1.0)
-        g = sep.outputs['Green']
-        if self.opts.flip_green:
-            g = self._math(nt, 'SUBTRACT', 1.0, g, (-650, y + 80))
-        yy = self._math(nt, 'MULTIPLY_ADD', g, 2.0, (-650, y - 60), -1.0)
-        return x, yy
+            nt.links.new(vector, tex.inputs['Vector'])
+        return tex, dxt5nm
 
     def _normal_out(self, nt, bsdf, normals, y):
-        """Sum the maps' X and Y (the detail normal adds to the base one, as in UDN blending),
-        rebuild Z from the first map, and feed a Normal Map node (which normalises)."""
-        x, yy = normals[0]
-        z = self._math(nt, 'SQRT', self._math(nt, 'MAXIMUM', self._math(
-            nt, 'SUBTRACT', 1.0, self._math(nt, 'ADD', self._math(nt, 'MULTIPLY', x, x, (-500, y - 200)),
-                                            self._math(nt, 'MULTIPLY', yy, yy, (-500, y - 60)), (-350, y - 120)),
-            (-200, y - 120)), 0.0, (-50, y - 120)), None, (100, y - 120))
-        for k, (dx, dy) in enumerate(normals[1:]):
-            x = self._math(nt, 'ADD', x, dx, (-350, y - 300 - 80 * k))
-            yy = self._math(nt, 'ADD', yy, dy, (-350, y - 340 - 80 * k))
-        comb = nt.nodes.new('ShaderNodeCombineColor')
-        comb.location = (400, y)
-        nt.links.new(self._math(nt, 'MULTIPLY_ADD', x, 0.5, (250, y + 60), 0.5), comb.inputs[0])
-        nt.links.new(self._math(nt, 'MULTIPLY_ADD', yy, 0.5, (250, y - 40), 0.5), comb.inputs[1])
-        nt.links.new(self._math(nt, 'MULTIPLY_ADD', z, 0.5, (250, y - 120), 0.5), comb.inputs[2])
+        """Feed the normal map(s) through the shared *MAG Normal* group (decode, detail sum, Z
+        rebuild) into a Normal Map node."""
+        assert 1 <= len(normals) <= 2
+        links = nt.links
+        grp = nt.nodes.new('ShaderNodeGroup')
+        grp.node_tree = normal_group(self.opts.flip_green)
+        grp.location, grp.label = (-100, y), 'MAG Normal'
+        for (tex, dxt5nm), pre in zip(normals, ('', 'Detail ')):
+            links.new(tex.outputs['Color'], grp.inputs[pre + 'Color'])
+            links.new(tex.outputs['Alpha'], grp.inputs[pre + 'Alpha'])
+            grp.inputs[pre + 'DXT5nm'].default_value = 1.0 if dxt5nm else 0.0
+        grp.inputs['Detail'].default_value = 1.0 if len(normals) > 1 else 0.0
         nm = nt.nodes.new('ShaderNodeNormalMap')
-        nm.location = (550, y)
+        nm.location = (100, y)
         nm.uv_map = 'UVMap'
-        nt.links.new(comb.outputs[0], nm.inputs['Color'])
-        nt.links.new(nm.outputs[0], bsdf.inputs['Normal'])
+        links.new(grp.outputs['Normal'], nm.inputs['Color'])
+        links.new(nm.outputs[0], bsdf.inputs['Normal'])
 
     def _detail_uv(self, nt, scale, label, y):
         """UV0 scaled by a detail map's scale (the same V flip as the material UV transform)."""
@@ -645,6 +644,76 @@ def _current_group(name, socket):
     return None
 
 
+def normal_group(flip_green=False):
+    """Shared 'MAG Normal' node group: decodes a normal map (DXT5nm: X in alpha, Y in green; RGB:
+    X in red) to tangent X/Y in -1..1, adds a detail normal map's X/Y when *Detail* is 1 (as in
+    UDN blending), rebuilds Z from the base map and outputs the colour for a Normal Map node
+    (which normalises). One group instead of ~20 nodes per material keeps imports fast."""
+    name = 'MAG Normal' + (' (flip G)' if flip_green else '')
+    ng = _current_group(name, 'Detail DXT5nm')
+    if ng is not None:
+        return ng
+    ng = bpy.data.node_groups.new(name, 'ShaderNodeTree')
+    io = ng.interface
+    for pre in ('', 'Detail '):
+        io.new_socket(pre + 'Color', in_out='INPUT', socket_type='NodeSocketColor')
+        io.new_socket(pre + 'Alpha', in_out='INPUT', socket_type='NodeSocketFloat')
+        s = io.new_socket(pre + 'DXT5nm', in_out='INPUT', socket_type='NodeSocketFloat')
+        s.default_value, s.min_value, s.max_value = 1.0, 0.0, 1.0
+    s = io.new_socket('Detail', in_out='INPUT', socket_type='NodeSocketFloat')
+    s.default_value, s.min_value, s.max_value = 0.0, 0.0, 1.0
+    io.new_socket('Normal', in_out='OUTPUT', socket_type='NodeSocketColor')
+    nodes, links = ng.nodes, ng.links
+    gi = nodes.new('NodeGroupInput')
+    gi.location = (-1000, 0)
+    go = nodes.new('NodeGroupOutput')
+    go.location = (900, 0)
+    col = [0]
+
+    def math(op, a, b=None, c=None):
+        n = nodes.new('ShaderNodeMath')
+        n.operation = op
+        col[0] += 1
+        n.location = (-500 + 130 * (col[0] % 10), 300 - 160 * (col[0] // 10))
+        for i, v in enumerate((a, b, c)):
+            if v is None:
+                continue
+            if isinstance(v, (int, float)):
+                n.inputs[i].default_value = v
+            else:
+                links.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    def xy(pre, y):
+        sep = nodes.new('ShaderNodeSeparateColor')
+        sep.location = (-750, y)
+        links.new(gi.outputs[pre + 'Color'], sep.inputs[0])
+        mix = nodes.new('ShaderNodeMix')  # float mix: exactly red at 0, alpha at 1
+        mix.data_type, mix.location = 'FLOAT', (-600, y)
+        links.new(gi.outputs[pre + 'DXT5nm'], mix.inputs['Factor'])
+        links.new(sep.outputs['Red'], mix.inputs['A'])
+        links.new(gi.outputs[pre + 'Alpha'], mix.inputs['B'])
+        x = math('MULTIPLY_ADD', mix.outputs['Result'], 2.0, -1.0)
+        g = sep.outputs['Green']
+        if flip_green:
+            g = math('SUBTRACT', 1.0, g)
+        return x, math('MULTIPLY_ADD', g, 2.0, -1.0)
+
+    x, yy = xy('', 200)
+    dx, dy = xy('Detail ', -300)
+    z = math('SQRT', math('MAXIMUM', math('SUBTRACT', 1.0, math('ADD', math('MULTIPLY', x, x),
+                                                                  math('MULTIPLY', yy, yy))), 0.0))
+    x = math('MULTIPLY_ADD', dx, gi.outputs['Detail'], x)
+    yy = math('MULTIPLY_ADD', dy, gi.outputs['Detail'], yy)
+    comb = nodes.new('ShaderNodeCombineColor')
+    comb.location = (700, 0)
+    links.new(math('MULTIPLY_ADD', x, 0.5, 0.5), comb.inputs[0])
+    links.new(math('MULTIPLY_ADD', yy, 0.5, 0.5), comb.inputs[1])
+    links.new(math('MULTIPLY_ADD', z, 0.5, 0.5), comb.inputs[2])
+    links.new(comb.outputs[0], go.inputs['Normal'])
+    return ng
+
+
 TERRAIN_FADE_RATIO = 2.0  # the macro fade ends at this multiple of its start distance
 
 
@@ -652,8 +721,12 @@ def set_terrain_fade(ng, start):
     """Set the camera distances of the layers -> macro fade in a *MAG Terrain* group
     (``start <= 0`` turns it off)."""
     s, e = (start, start * TERRAIN_FADE_RATIO) if start > 0 else (1e9, 2e9)
-    ng.nodes['Macro Fade Start'].outputs[0].default_value = s
-    ng.nodes['Macro Fade End'].outputs[0].default_value = e
+    # Only write changes: every write re-tags all materials using the shared group, which made
+    # setting it once per terrain tile cost ~1 s per map.
+    for node, v in (('Macro Fade Start', s), ('Macro Fade End', e)):
+        sock = ng.nodes[node].outputs[0]
+        if abs(sock.default_value - v) > 1e-4 * max(1.0, abs(v)):  # float32 socket
+            sock.default_value = v
 
 
 def terrain_group(flip_green=False):
@@ -1127,6 +1200,16 @@ def build_map(lib, level_index, opts, mcache, scene, progress=None):
             hits[h] = hit
     terrain = terrain_tiles(lv, opts.terrain_lod) if opts.include_terrain else []
     lib.prefetch([hz for _, hz, _ in hits.values()] + [zi for zi, _ in terrain])
+    if opts.materials:  # convert missing textures in parallel (first import of a map)
+        pairs = []
+        for zi, ri in [(hz, hr) for _, hz, hr in hits.values()] + list(terrain):
+            try:
+                pairs.extend((me.material, zi) for me in lib.model_header(zi, ri).meshes)
+            except Exception as e:
+                print('MAG: texture prefetch skipped %d/%d: %s' % (zi, ri, e))
+        n = mcache.prefetch(pairs)
+        if n:
+            print('MAG: converted %d textures in parallel' % n)
     if terrain:
         tcoll = bpy.data.collections.new('MAG_%s_terrain' % name)
         map_coll.children.link(tcoll)

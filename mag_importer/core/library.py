@@ -138,8 +138,7 @@ class Library:
             return None, {}
         meta = {'alpha': False, 'dxt5nm': False, 'fmt': t.label, 'size': [t.width, t.height]}
         try:
-            px = textures.decode_rgba(t, raw)
-            s = px[::max(1, px.shape[0] // 64), ::max(1, px.shape[1] // 64)].reshape(-1, 4).astype(np.float32) / 255.0
+            s = textures.sample_rgba(t, raw, 64).reshape(-1, 4).astype(np.float32) / 255.0
             meta['alpha'] = bool((s[:, 3] < 0.5).mean() > 0.01)
             mean = s.mean(0)
             meta['dxt5nm'] = bool(mean[0] < 0.05 and mean[2] < 0.05)
@@ -152,6 +151,25 @@ class Library:
         with open(meta_path, 'w') as f:
             json.dump(meta, f)
         return path, meta
+
+    def texture_cached(self, name):
+        path = os.path.join(self.tex_dir, '%08x.dds' % name)
+        return os.path.exists(path) and os.path.exists(path + '.json')
+
+    def prefetch_textures(self, items, workers=8):
+        """Convert many textures into the cache in parallel (decompression, numpy and file I/O
+        release the GIL). ``items``: (texture name, near_zrb). Returns the number converted."""
+        todo = {}
+        for name, near in items:
+            if name not in todo and not self.texture_cached(name):
+                todo[name] = near
+        if not todo:
+            return 0
+        self.index.by_name()  # build the lookup tables once, before the threads use them
+        self.texture_hashes()
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(lambda kv: self.texture_file(*kv), todo.items()))
+        return len(todo)
 
     # -- havok -----------------------------------------------------------------------------------
     def packfile(self, zi, ri):

@@ -113,7 +113,15 @@ point at a cache location that no longer exists relinks them to the current cach
 * Havok spline curves are evaluated for all frames at once (vectorized B-spline basis).
   All 568 character animations decode in about 2 seconds.
 * Maps prefetch and decompress their resource blocks in parallel, build each unique piece once,
-  and place it with collection instances. A full map takes 2–9 seconds.
+  and place it with collection instances. A full map takes 2–8 seconds (Baku, the largest,
+  about 7 s).
+* The first import of a map converts its missing textures in parallel, and only the DXT blocks
+  sampled for the alpha/normal check are decoded. With an empty texture cache, Baku takes about
+  9 s instead of 17 s.
+* Materials share node groups (*MAG Terrain*, *MAG Normal*) instead of rebuilding the same maths
+  in every material.
+* `tools/profile_import.py` profiles a character, animations, a vehicle and a map (cProfile, per
+  stage, warm or cold texture cache, optional first EEVEE frame).
 * Decompressed blocks are kept in an LRU cache (768 MB).
 
 ## Layout
