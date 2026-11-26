@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "mag_importer"
+version = "1.0.0"
+name = "MAG Importer"
+tagline = "Import MAG (PS3) characters, weapons, vehicles, maps, animations"
+maintainer = "MAG-Blender"
+type = "add-on"
+
+blender_version_min = "4.4.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Import-Export"]
+
+[permissions]
+files = "Reads the MAG disc image, writes an index and texture cache"
